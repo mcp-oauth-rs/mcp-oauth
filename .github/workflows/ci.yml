@@ -1,0 +1,106 @@
+name: CI
+
+# Pushes and pull requests are the gate. The weekly run on the default branch
+# notices drift nobody committed: a new toolchain lint, a registry change.
+# Every job is one ci/run.sh job, runnable locally the same way.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+# A newer push supersedes the run in flight for the same ref; scheduled and
+# manual runs are never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ride out transient crates.io blips instead of failing the job.
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  no-ai-traces:
+    name: No AI traces
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The script checks every commit, so it needs all of them.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check commit messages, added lines, paths and pull request text
+        env:
+          # Passed through the environment, never interpolated into the shell.
+          # A bot's title and body are skipped: Renovate pastes upstream
+          # release notes, which this project did not write. Its commits and
+          # diff are still checked.
+          PR_TITLE: ${{ github.event.pull_request.user.type != 'Bot' && github.event.pull_request.title || '' }}
+          PR_BODY: ${{ github.event.pull_request.user.type != 'Bot' && github.event.pull_request.body || '' }}
+        run: ci/run.sh noai
+
+  zizmor:
+    name: Workflow security (zizmor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/run.sh zizmor
+        env:
+          CI_TOOLS: ${{ runner.temp }}
+
+  gitleaks:
+    name: Gitleaks (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # Pinned release binary, checked by SHA-256 in ci/run.sh. Reviewed false
+      # positives are listed in .gitleaksignore.
+      - run: ci/run.sh gitleaks
+        env:
+          CI_TOOLS: ${{ runner.temp }}
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/run.sh fmt
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/run.sh clippy
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/run.sh test
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: ci/run.sh doc

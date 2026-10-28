@@ -1,0 +1,9 @@
+# Reviewed gitleaks findings that are not secrets, one fingerprint per line.
+# Path-based (path:rule:line), so the entry holds for every commit that
+# carries the file unchanged at that line.
+#
+# src/testdata/cimd-test-leaf.key: test-only private key for the TLS leaf
+# certificate of `cimd.test` / `*.cimd.test`, used by the CIMD fetcher tests
+# (src/test_https.rs). It is signed by "mcp-oauth test CA", whose private key
+# is not committed, and it is trusted nowhere outside these tests.
+src/testdata/cimd-test-leaf.key:private-key:1

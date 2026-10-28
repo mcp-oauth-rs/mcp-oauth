@@ -1,0 +1,5 @@
+target/
+
+# Local-only notes: never commit
+/local/
+CLAUDE.md
