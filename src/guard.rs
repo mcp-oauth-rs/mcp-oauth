@@ -33,7 +33,7 @@
 //! routes that do not authenticate, 404s, 405s and extractor rejections
 //! included). The crate marks a valid bearer token and a successful token
 //! request; it never checks the owner password for a banned IP (see the
-//! README's threat model).
+//! threat model in `docs/threat-model.md`).
 //!
 //! Client IP: `CF-Connecting-IP` (set by Cloudflare; the front is assumed to
 //! be the only ingress), else the leftmost `X-Forwarded-For`, else "unknown".

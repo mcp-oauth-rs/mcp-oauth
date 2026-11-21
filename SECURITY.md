@@ -19,4 +19,4 @@ Fixes go into the latest release only.
 
 The threat model, including what is out of scope (a compromised host or
 state directory, a leaked owner password, volumetric DDoS), is in the
-README's [Threat model](README.md#threat-model) section.
+[threat model](docs/threat-model.md).

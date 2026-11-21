@@ -15,8 +15,8 @@
 //! and how much stays then depends on the number of arenas. Measured on
 //! a glibc 2.41, 20-core server (distinct IPs): unbounded, 60 concurrent
 //! wrong passwords peaked at 644 MiB and kept 643 MiB; bounded to 2, 3600
-//! checks kept 49-53 MiB over base with either kind of buffer. See the
-//! README.
+//! checks kept 49-53 MiB over base with either kind of buffer. See
+//! `docs/abuse-protection.md`.
 
 use argon2::{Algorithm, Argon2, Block, Params, PasswordHash, Version};
 use std::sync::atomic::{AtomicUsize, Ordering};

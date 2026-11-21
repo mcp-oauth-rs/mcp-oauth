@@ -11,8 +11,9 @@ readme = "README.md"
 keywords = ["mcp", "oauth", "axum", "authorization", "cimd"]
 categories = ["authentication", "web-programming::http-server"]
 # What goes into the published crate: the code, its tests and their test TLS
-# material, the README and the license; not the CI and repository files.
-include = ["/src/**", "/tests/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
+# material, the README and its docs/ parts, and the license; not the CI and
+# repository files.
+include = ["/src/**", "/tests/**", "/docs/**", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE"]
 
 [dependencies]
 argon2 = "0.6"
