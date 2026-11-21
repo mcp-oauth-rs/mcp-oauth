@@ -18,5 +18,5 @@ Fixes go into the latest release only.
 ## Scope
 
 The threat model, including what is out of scope (a compromised host or
-state directory, a leaked owner password, volumetric DDoS), is in the
+state directory, a compromised client, volumetric DDoS), is in the
 [threat model](docs/threat-model.md).

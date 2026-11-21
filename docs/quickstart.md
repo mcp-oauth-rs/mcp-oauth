@@ -17,53 +17,57 @@
 | Refresh token rotation with reuse detection | [OAuth 2.1](https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/) |
 | Token revocation | [RFC 7009](https://www.rfc-editor.org/rfc/rfc7009) |
 | Loopback redirects matched port-agnostically | [RFC 8252 §7.3](https://www.rfc-editor.org/rfc/rfc8252#section-7.3) |
-| Owner password: argon2id, at most 2 checks at once | [RFC 9106](https://www.rfc-editor.org/rfc/rfc9106) |
-| Per-IP rate limit, ban after repeated authentication failures, body cap, timeout, concurrency cap; optional shared-IP mode where a ban never cuts a client with valid credentials | (this crate) |
+| Sign-in: e-mail allowlist, single-use enrolment codes (24 h, typed, never a link), the user's address in every grant, long refresh tokens revoked per user at once, admin API for a command-line tool | (this crate) |
 
 ## Quickstart
 
-1. Hash the owner password once (argon2id PHC string), and keep the hash
-   out of git:
-
-   ```rust
-   let hash = mcp_oauth_server::hash_password(&password)?; // m=19 MiB, t=2, p=1
-   ```
-
-2. Mount the authorization server next to your MCP route and wrap the app
+1. Mount the authorization server next to your MCP route and wrap the app
    in the guard. This is the crate's doc test (`cargo test --doc` compiles
    it):
 
    ```rust
-   use axum::{Router, routing::any};
-   use mcp_oauth_server::{Config, Guard, Limits, OAuth, protect};
+   use axum::{Extension, Router, routing::any};
+   use mcp_oauth_server::{Config, Grant, Guard, Limits, OAuth, protect};
 
    fn app() -> Result<Router, String> {
    let oauth = OAuth::new(Config {
        issuer: "https://mcp.example.net".into(),
        mcp_path: "/mcp".into(),
-       owner_password_hash: std::env::var("OWNER_PASSWORD_HASH").map_err(|e| e.to_string())?,
        state_dir: "/state".into(),
        redirect_patterns: mcp_oauth_server::DEFAULT_REDIRECT_PATTERNS.iter().map(|s| s.to_string()).collect(),
        resource_name: "my-server".into(),
-       cimd_allowlist: None,
+       ..Default::default()
    })?;
+   let mcp = any(|Extension(g): Extension<Grant>| async move {
+       format!("hello {}", g.subject.unwrap_or_default())
+   });
    let app = Router::new()
-       .route("/mcp", any(|| async { "MCP here" }).layer(oauth.bearer_layer()))
+       .route("/mcp", mcp.layer(oauth.bearer_layer()))
        .merge(oauth.router());
    Ok(protect(app, Guard::new(Limits::default())))
    }
    ```
 
-   A handler behind `bearer_layer()` can read who called it:
-   `Extension(grant): Extension<mcp_oauth_server::Grant>` (`grant.client_id`,
-   `grant.scope`).
+   A handler behind `bearer_layer()` reads who called it from
+   `Extension<Grant>`: `client_id`, `scope` and `subject`, the user's
+   address. `Grant` is `#[non_exhaustive]`: read its fields, do not build or
+   destructure it exhaustively.
+
+2. Give your binary an admin command that allows an address and prints an
+   enrolment code (see [Users and sign-in](sign-in.md#admin-api)):
+
+   ```rust
+   let users = mcp_oauth_server::Users::open("/state")?;
+   users.allow("ada@example.org")?;
+   println!("{}", users.enrol_code("ada@example.org")?);
+   ```
 
 3. Serve it over HTTPS at the issuer origin, then add
    `https://mcp.example.net/mcp` as a custom connector in claude.ai or
    ChatGPT, or `claude mcp add --transport http my-server
    https://mcp.example.net/mcp` in Claude Code. No client ID or secret to
    type: the client discovers the metadata, identifies itself (CIMD or DCR)
-   and sends the owner to the login page ("Sign in to `resource_name`",
-   owner password, then "Allow").
+   and sends the user to the sign-in page ("Sign in to `resource_name`",
+   e-mail address and enrolment code, then "Allow").
 
 4. In production, set the [CIMD allowlist](cimd-allowlist.md).

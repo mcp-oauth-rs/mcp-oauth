@@ -3,7 +3,7 @@
 
 use crate::cimd::tests::{CHATGPT, CHATGPT_DOC, CLAUDE, CLAUDE_CODE, CLAUDE_CODE_DOC, CLAUDE_DOC};
 use crate::jwt::tests::{Signer, claims};
-use crate::oauth::tests::{config, tmp_dir};
+use crate::oauth::tests::{TEST_USER, config, tmp_dir};
 use crate::{Grant, Guard, Limits, OAuth, protect};
 use axum::{
     Extension, Router,
@@ -16,7 +16,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
-const PW: &str = "correct horse battery staple";
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 const IP: &str = "198.51.100.7";
 const JWKS: &str = "https://chatgpt.com/oauth/jwks.json";
@@ -105,15 +104,27 @@ fn app_with(o: &OAuth, lim: Limits) -> Router {
 
 fn setup(tag: &str, allowlist: Option<Vec<String>>) -> (std::path::PathBuf, OAuth, Router) {
     let dir = tmp_dir(tag);
-    let mut c = config(&dir, &crate::hash_password(PW).unwrap());
+    let mut c = config(&dir);
     c.cimd_allowlist = allowlist;
     let o = OAuth::new_for_tests(c).unwrap();
     let app = app_with(&o, Limits::default());
     (dir, o, app)
 }
 
-/// authorize (GET) -> login -> consent -> code, for `client_id` and `redirect`.
-async fn authorize(app: &Router, client_id: &str, redirect: &str, expect: &[&str]) -> String {
+/// A fresh enrolment code for [`TEST_USER`] (allowed on the way).
+fn enrol(o: &OAuth) -> String {
+    o.users().allow(TEST_USER).unwrap();
+    o.users().enrol_code(TEST_USER).unwrap()
+}
+
+/// authorize (GET) -> login (address and code) -> consent -> code, for `client_id` and `redirect`.
+async fn authorize(
+    o: &OAuth,
+    app: &Router,
+    client_id: &str,
+    redirect: &str,
+    expect: &[&str],
+) -> String {
     let ch = challenge();
     let params = [
         ("response_type", "code"),
@@ -131,8 +142,9 @@ async fn authorize(app: &Router, client_id: &str, redirect: &str, expect: &[&str
     for e in expect {
         assert!(r.body.contains(e), "{e} not in {}", r.body);
     }
+    let code = enrol(o);
     let mut login = params.to_vec();
-    login.extend([("step", "login"), ("password", PW)]);
+    login.extend([("step", "login"), ("email", TEST_USER), ("code", &code)]);
     let r = send(app, form("/oauth/authorize", &login)).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let ticket = hidden_value(&r.body, "ticket");
@@ -169,7 +181,7 @@ fn exchange<'a>(
 
 #[tokio::test]
 async fn dcr_flow_and_bearer_layer() {
-    let (dir, _o, app) = setup("dcr", None);
+    let (dir, o, app) = setup("dcr", None);
     let r = send(&app, mcp(None)).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -186,6 +198,7 @@ async fn dcr_flow_and_bearer_layer() {
     assert_eq!(r.status, StatusCode::CREATED, "{}", r.body);
     let id = r.json()["client_id"].as_str().unwrap().to_string();
     let code = authorize(
+        &o,
         &app,
         &id,
         cb,
@@ -211,6 +224,7 @@ async fn cimd_public_clients() {
     o.cimd().serve(CLAUDE_CODE, 200, CLAUDE_CODE_DOC.as_bytes());
     let cb = "https://claude.ai/api/mcp/auth_callback";
     let code = authorize(
+        &o,
         &app,
         CLAUDE,
         cb,
@@ -241,6 +255,7 @@ async fn cimd_public_clients() {
 
     // Claude Code: loopback redirect on any port.
     let code = authorize(
+        &o,
         &app,
         CLAUDE_CODE,
         "http://localhost:51234/callback",
@@ -346,6 +361,7 @@ async fn cimd_private_key_jwt() {
     );
 
     let code = authorize(
+        &o,
         &app,
         CHATGPT,
         cb,
@@ -429,7 +445,7 @@ async fn cimd_private_key_jwt() {
     let r = send(&app, post(&rf)).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     // ChatGPT's document also declares `none`: PKCE-only exchange accepted.
-    let code = authorize(&app, CHATGPT, cb, &[]).await;
+    let code = authorize(&o, &app, CHATGPT, cb, &[]).await;
     let r = send(&app, form("/oauth/token", &exchange(CHATGPT, &code, cb))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
 
@@ -438,7 +454,7 @@ async fn cimd_private_key_jwt() {
     let doc = json!({"client_id":strict,"client_name":"Agent","redirect_uris":[cb],
         "token_endpoint_auth_method":"private_key_jwt","jwks":{"keys":[signer.jwk("k1")]}});
     o.cimd().serve(strict, 200, doc.to_string().as_bytes());
-    let code = authorize(&app, strict, cb, &["agent.example"]).await;
+    let code = authorize(&o, &app, strict, cb, &["agent.example"]).await;
     let r = send(&app, form("/oauth/token", &exchange(strict, &code, cb))).await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
     assert!(r.body.contains("private_key_jwt"));
@@ -461,7 +477,7 @@ async fn cimd_private_key_jwt() {
         .as_str()
         .unwrap()
         .to_string();
-    let code = authorize(&app, &id, cb, &[]).await;
+    let code = authorize(&o, &app, &id, cb, &[]).await;
     let mut v: Vec<(&'static str, String)> = exchange(&id, &code, cb)
         .into_iter()
         .map(|(k, x)| (k, x.to_string()))
@@ -510,8 +526,8 @@ fn tokens(r: &Resp) -> (String, String) {
     )
 }
 
-fn allowlisted(dir: &std::path::Path, hash: &str, grace: bool) -> (OAuth, Router) {
-    let mut c = config(dir, hash);
+fn allowlisted(dir: &std::path::Path, grace: bool) -> (OAuth, Router) {
+    let mut c = config(dir);
     c.cimd_allowlist = Some(vec![CLAUDE.into()]);
     let o = OAuth::new_for_tests(c).unwrap();
     assert!(o.dcr_grace(), "on by default");
@@ -523,14 +539,13 @@ fn allowlisted(dir: &std::path::Path, hash: &str, grace: bool) -> (OAuth, Router
 #[tokio::test]
 async fn allowlist_disables_dcr() {
     let dir = tmp_dir("allow");
-    let hash = crate::hash_password(PW).unwrap();
     let cb = "https://claude.ai/api/mcp/auth_callback";
     let gpt = "https://chatgpt.com/connector_platform_oauth_redirect";
     // Two clients registered by DCR before the allowlist was set (a public
     // one, like Claude's, and a confidential one, like ChatGPT's), each
     // holding a token family...
-    let open = OAuth::new_for_tests(config(&dir, &hash)).unwrap();
-    let app = app_with(&open, Limits::default());
+    let o = OAuth::new_for_tests(config(&dir)).unwrap();
+    let app = app_with(&o, Limits::default());
     let (pub_id, _) = register(&app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#)).await;
     let (conf_id, secret) = register(
         &app,
@@ -540,17 +555,17 @@ async fn allowlist_disables_dcr() {
     )
     .await;
     let secret = secret.expect("confidential client gets a secret");
-    let code = authorize(&app, &pub_id, cb, &[]).await;
+    let code = authorize(&o, &app, &pub_id, cb, &[]).await;
     let (pub_access, pub_refresh) =
         tokens(&send(&app, form("/oauth/token", &exchange(&pub_id, &code, cb))).await);
-    let code = authorize(&app, &conf_id, gpt, &[]).await;
+    let code = authorize(&o, &app, &conf_id, gpt, &[]).await;
     let mut ex = exchange(&conf_id, &code, gpt);
     ex.push(("client_secret", &secret));
     let (conf_access, conf_refresh) = tokens(&send(&app, form("/oauth/token", &ex)).await);
-    drop((open, app));
+    drop((o, app));
 
     // ...then the server restarts with an allowlist (dcr_grace on).
-    let (o, app) = allowlisted(&dir, &hash, true);
+    let (o, app) = allowlisted(&dir, true);
     let r = send(&app, get("/.well-known/oauth-authorization-server")).await;
     let asm = r.json();
     assert!(asm.get("registration_endpoint").is_none(), "{asm}");
@@ -562,7 +577,7 @@ async fn allowlist_disables_dcr() {
     assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
     // Allowlisted CIMD client: fine.
     o.cimd().serve(CLAUDE, 200, CLAUDE_DOC.as_bytes());
-    let code = authorize(&app, CLAUDE, cb, &["Claude"]).await;
+    let code = authorize(&o, &app, CLAUDE, cb, &["Claude"]).await;
     let (cimd_access, _) =
         tokens(&send(&app, form("/oauth/token", &exchange(CLAUDE, &code, cb))).await);
     // Other URLs are refused, even with a valid document.
@@ -622,7 +637,7 @@ async fn allowlist_disables_dcr() {
 
     // Restart with dcr_grace off: the DCR clients are cut off at once,
     // the allowlisted client is not; nothing of this counts as a failure.
-    let (o, app) = allowlisted(&dir, &hash, false);
+    let (o, app) = allowlisted(&dir, false);
     for access in [&pub_access, &conf_access] {
         let r = send(&app, mcp(Some(access))).await;
         assert_eq!(r.status, StatusCode::UNAUTHORIZED);
@@ -649,7 +664,7 @@ async fn allowlist_disables_dcr() {
     assert_eq!((r.status, r.body.as_str()), (StatusCode::OK, CLAUDE));
     // The state is untouched: turning the grace back on restores them.
     drop((o, app));
-    let (_o, app) = allowlisted(&dir, &hash, true);
+    let (_o, app) = allowlisted(&dir, true);
     let r = send(&app, mcp(Some(&pub_access))).await;
     assert_eq!(
         (r.status, r.body.as_str()),
@@ -661,7 +676,7 @@ async fn allowlist_disables_dcr() {
 #[tokio::test]
 async fn failures_that_count_and_those_that_do_not() {
     let dir = tmp_dir("count");
-    let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
+    let o = OAuth::new_for_tests(config(&dir)).unwrap();
     let app = app_with(
         &o,
         Limits {
@@ -713,7 +728,7 @@ async fn failures_that_count_and_those_that_do_not() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Login form for a DCR client registered on `app` (wrong password unless `pw`).
+/// Login form for a DCR client registered on `app`.
 async fn login_form(app: &Router) -> Vec<(&'static str, String)> {
     let cb = "https://claude.ai/api/mcp/auth_callback";
     let (id, _) = register(app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#)).await;
@@ -728,105 +743,15 @@ async fn login_form(app: &Router) -> Vec<(&'static str, String)> {
     ]
 }
 
-fn login_req(f: &[(&'static str, String)], password: &str, ip: &str) -> Request<Body> {
+/// The login step of `f` with an address and a code, from `ip`.
+fn login_req(f: &[(&'static str, String)], email: &str, code: &str, ip: &str) -> Request<Body> {
     let mut f: Vec<(&str, &str)> = f.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    f.push(("password", password));
+    f.extend([("email", email), ("code", code)]);
     Request::post("/oauth/authorize")
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header("cf-connecting-ip", ip)
         .body(Body::from(serde_urlencoded::to_string(&f).unwrap()))
         .unwrap()
-}
-
-/// All password slots busy: the login is answered at once with 503 and
-/// Retry-After, the login page is shown again (form kept), no failure is
-/// counted and no password is checked.
-#[tokio::test]
-async fn password_checks_bounded() {
-    let dir = tmp_dir("pwbusy");
-    let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
-    assert_eq!(o.max_password_checks(), crate::DEFAULT_MAX_PASSWORD_CHECKS);
-    assert_eq!(crate::DEFAULT_MAX_PASSWORD_CHECKS, 2);
-    let app = app_with(
-        &o,
-        Limits {
-            max_failures: 2,
-            ..Default::default()
-        },
-    );
-    let f = login_form(&app).await;
-    let pool = o.password_pool().clone();
-    let held = [pool.try_slot().unwrap(), pool.try_slot().unwrap()];
-    for _ in 0..5 {
-        let r = send(&app, login_req(&f, "wrong password", IP)).await;
-        assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE, "{}", r.body);
-        assert_eq!(r.headers[header::RETRY_AFTER], "2");
-        assert!(
-            r.body.contains("Too many sign-ins in progress"),
-            "{}",
-            r.body
-        );
-        assert!(r.body.contains(r#"name="password""#), "login form kept");
-    }
-    // Even the right password is refused while busy (it is never looked at).
-    let r = send(&app, login_req(&f, PW, IP)).await;
-    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(pool.usage(), (2, 0), "nothing allocated by refused logins");
-    drop(held);
-    // 503s were not failures: one wrong password is not a ban (max 2).
-    let r = send(&app, login_req(&f, "wrong password", IP)).await;
-    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
-    let r = send(&app, login_req(&f, PW, IP)).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
-    assert!(r.body.contains(r#"name="ticket""#));
-    assert_eq!(pool.usage(), (0, 1), "one buffer, reused");
-    // Configurable.
-    let o = o.with_max_password_checks(1);
-    assert_eq!(o.max_password_checks(), 1);
-    let _held = pool.try_slot().unwrap();
-    let r = send(&app, login_req(&f, PW, IP)).await;
-    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-/// 16 simultaneous wrong passwords from 16 IPs: never more than
-/// DEFAULT_MAX_PASSWORD_CHECKS argon2 buffers; the others get 503 at once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn concurrent_logins_bounded() {
-    let dir = tmp_dir("pwconc");
-    let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
-    let app = app_with(&o, Limits::default());
-    let f = login_form(&app).await;
-    let start = std::sync::Arc::new(tokio::sync::Barrier::new(16));
-    let mut tasks = Vec::new();
-    for i in 0..16 {
-        let (app, f, start) = (app.clone(), f.clone(), start.clone());
-        tasks.push(tokio::spawn(async move {
-            start.wait().await;
-            let ip = format!("203.0.113.{}", i + 1);
-            send(&app, login_req(&f, "wrong password", &ip))
-                .await
-                .status
-        }));
-    }
-    let mut codes = Vec::new();
-    for t in tasks {
-        codes.push(t.await.unwrap());
-    }
-    let wrong = codes
-        .iter()
-        .filter(|c| **c == StatusCode::UNAUTHORIZED)
-        .count();
-    let busy = codes
-        .iter()
-        .filter(|c| **c == StatusCode::SERVICE_UNAVAILABLE)
-        .count();
-    assert_eq!(wrong + busy, 16, "{codes:?}");
-    assert!(wrong >= 1 && busy >= 1, "{codes:?}");
-    let (running, buffers) = o.password_pool().usage();
-    assert_eq!(running, 0);
-    assert!(buffers <= crate::DEFAULT_MAX_PASSWORD_CHECKS, "{buffers}");
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// A wrong PKCE verifier for a live code counts as an authentication
@@ -839,7 +764,7 @@ async fn pkce_mismatch_counts_for_dcr_and_cimd_clients() {
     let cb = "https://claude.ai/api/mcp/auth_callback";
     for kind in ["dcr", "cimd"] {
         let dir = tmp_dir(&format!("pkce-{kind}"));
-        let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
+        let o = OAuth::new_for_tests(config(&dir)).unwrap();
         let app = app_with(
             &o,
             Limits {
@@ -871,12 +796,12 @@ async fn pkce_mismatch_counts_for_dcr_and_cimd_clients() {
         let other = register(&app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#))
             .await
             .0;
-        let code = authorize(&app, &id, cb, &[]).await;
+        let code = authorize(&o, &app, &id, cb, &[]).await;
         for _ in 0..3 {
             let r = send(&app, form("/oauth/token", &exchange(&other, &code, cb))).await;
             assert_eq!(r.status, StatusCode::BAD_REQUEST, "{kind}: {}", r.body);
         }
-        let code = authorize(&app, &id, cb, &[]).await;
+        let code = authorize(&o, &app, &id, cb, &[]).await;
         let r = send(&app, form("/oauth/token", &exchange(&id, &code, cb))).await;
         tokens(&r);
         for _ in 0..3 {
@@ -891,7 +816,7 @@ async fn pkce_mismatch_counts_for_dcr_and_cimd_clients() {
         );
         // Wrong verifier on live codes: counted, banned at the 3rd.
         for i in 0..3 {
-            let code = authorize(&app, &id, cb, &[]).await;
+            let code = authorize(&o, &app, &id, cb, &[]).await;
             let mut ex = exchange(&id, &code, cb);
             ex.retain(|(k, _)| *k != "code_verifier");
             if i != 1 {
@@ -968,7 +893,7 @@ async fn cimd_over_https_vendor_clients() {
     );
 
     let dir = tmp_dir("cimd-https");
-    let mut c = config(&dir, &crate::hash_password(PW).unwrap());
+    let mut c = config(&dir);
     c.cimd_allowlist = Some(vec![
         claude.clone(),
         code_cli.clone(),
@@ -988,14 +913,14 @@ async fn cimd_over_https_vendor_clients() {
 
     // Claude.
     let cb = "https://claude.ai/api/mcp/auth_callback";
-    let code = authorize(&app, &claude, cb, &["<b>Claude</b>"]).await;
+    let code = authorize(&o, &app, &claude, cb, &["<b>Claude</b>"]).await;
     let (access, _) =
         tokens(&send(&app, form("/oauth/token", &exchange(&claude, &code, cb))).await);
     assert_eq!(send(&app, mcp(Some(&access))).await.body, claude);
 
     // Claude Code: loopback redirect on an ephemeral port.
     let loopback = "http://127.0.0.1:43117/callback";
-    let code = authorize(&app, &code_cli, loopback, &["Claude Code"]).await;
+    let code = authorize(&o, &app, &code_cli, loopback, &["Claude Code"]).await;
     let (access, _) = tokens(
         &send(
             &app,
@@ -1014,7 +939,7 @@ async fn cimd_over_https_vendor_clients() {
     let gcb = "https://chatgpt.com/connector_platform_oauth_redirect";
     let token_url = "https://issuer.test/oauth/token";
     let now = crate::oauth::unix_now();
-    let code = authorize(&app, &gpt, gcb, &["<b>ChatGPT</b>"]).await;
+    let code = authorize(&o, &app, &gpt, gcb, &["<b>ChatGPT</b>"]).await;
     let good = signer.sign(Some("k1"), &claims(&gpt, token_url, now));
     let mut ex = exchange(&gpt, &code, gcb);
     ex.push(("client_assertion_type", crate::jwt::ASSERTION_TYPE));
@@ -1133,7 +1058,7 @@ async fn cimd_fetch_memory() {
             );
         }
         let dir = tmp_dir("cimd-mem");
-        let mut c = config(&dir, &crate::hash_password(PW).unwrap());
+        let mut c = config(&dir);
         c.cimd_allowlist = match (allow, distinct) {
             (true, true) => Some(vec![srv.url("x", "/allowed")]),
             (true, false) => Some(vec![urls[0].clone()]),
@@ -1201,12 +1126,12 @@ fn at(ip: &str, mut req: Request<Body>) -> Request<Body> {
 /// credentials keeps working (bearer token, refresh, code exchange with
 /// PKCE, client secret, client assertion, live sign-in ticket, revocation,
 /// plus the metadata and the expired-token 401 a client needs to refresh);
-/// everything else gets the same 429, the owner password is never checked
-/// (no oracle), nothing is registered and nothing more is counted.
+/// everything else gets the same 429, an enrolment code is never checked
+/// (no oracle, not used up), nothing is registered and nothing more is counted.
 #[tokio::test]
 async fn shared_ip_ban_serves_valid_credentials_only() {
     let dir = tmp_dir("shared-ip");
-    let o = OAuth::new_for_tests(config(&dir, &crate::hash_password(PW).unwrap())).unwrap();
+    let o = OAuth::new_for_tests(config(&dir)).unwrap();
     let guard = Guard::new(Limits {
         max_failures: 3,
         per_ip_burst: 1000.0,
@@ -1231,13 +1156,13 @@ async fn shared_ip_ban_serves_valid_credentials_only() {
     // one for a wrong verifier; a live sign-in ticket; a confidential DCR
     // client; Claude (CIMD, public) and ChatGPT (CIMD, private_key_jwt).
     let (id, _) = register(&app, &format!(r#"{{"redirect_uris":["{cb}"]}}"#)).await;
-    let code = authorize(&app, &id, cb, &[]).await;
+    let code = authorize(&o, &app, &id, cb, &[]).await;
     let (access, refresh) =
         tokens(&send(&app, form("/oauth/token", &exchange(&id, &code, cb))).await);
-    let spare_code = authorize(&app, &id, cb, &[]).await;
-    let stolen_code = authorize(&app, &id, cb, &[]).await;
+    let spare_code = authorize(&o, &app, &id, cb, &[]).await;
+    let stolen_code = authorize(&o, &app, &id, cb, &[]).await;
     let f = login_form(&app).await;
-    let r = send(&app, login_req(&f, PW, IP)).await;
+    let r = send(&app, login_req(&f, TEST_USER, &enrol(&o), IP)).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     let ticket = hidden_value(&r.body, "ticket");
     let (cid, secret) = register(
@@ -1248,12 +1173,12 @@ async fn shared_ip_ban_serves_valid_credentials_only() {
     )
     .await;
     let secret = secret.unwrap();
-    let ccode = authorize(&app, &cid, cb, &[]).await;
+    let ccode = authorize(&o, &app, &cid, cb, &[]).await;
     let mut ex = exchange(&cid, &ccode, cb);
     ex.push(("client_secret", &secret));
     let (_, crefresh) = tokens(&send(&app, form("/oauth/token", &ex)).await);
     o.cimd().serve(CLAUDE, 200, CLAUDE_DOC.as_bytes());
-    let ccode = authorize(&app, CLAUDE, cb, &[]).await;
+    let ccode = authorize(&o, &app, CLAUDE, cb, &[]).await;
     let (_, claude_refresh) =
         tokens(&send(&app, form("/oauth/token", &exchange(CLAUDE, &ccode, cb))).await);
     let signer = Signer::rsa("RS256");
@@ -1263,7 +1188,7 @@ async fn shared_ip_ban_serves_valid_credentials_only() {
         200,
         json!({"keys":[signer.jwk("k1")]}).to_string().as_bytes(),
     );
-    let gcode = authorize(&app, CHATGPT, gpt_cb, &[]).await;
+    let gcode = authorize(&o, &app, CHATGPT, gpt_cb, &[]).await;
     let (_, gpt_refresh) = tokens(
         &send(
             &app,
@@ -1366,7 +1291,7 @@ async fn shared_ip_ban_serves_valid_credentials_only() {
         ("client_assertion", &good),
     ]);
     tokens(&send(&app, form("/oauth/token", &rf)).await);
-    // A live sign-in ticket (the owner typed the password before the ban).
+    // A live sign-in ticket (the user typed a valid code before the ban).
     let consent = [
         ("step", "consent"),
         ("ticket", ticket.as_str()),
@@ -1379,22 +1304,22 @@ async fn shared_ip_ban_serves_valid_credentials_only() {
         "used ticket",
     );
 
-    // The owner password is never checked for a banned IP: right and wrong
-    // passwords get the same 429, no argon2 run, not even a slot taken.
-    let pool = o.password_pool().clone();
-    let usage = pool.usage();
-    let right = send(&app, login_req(&f, PW, IP)).await;
-    let wrong = send(&app, login_req(&f, "guess", IP)).await;
-    banned(&right, "right password");
-    banned(&wrong, "wrong password");
+    // An enrolment code is never checked for a banned IP: right and wrong
+    // codes get the same 429, and the right one is not used up.
+    let live = enrol(&o);
+    let right = send(&app, login_req(&f, TEST_USER, &live, IP)).await;
+    let wrong = send(&app, login_req(&f, TEST_USER, "0000-0000-0000-0000", IP)).await;
+    banned(&right, "right code");
+    banned(&wrong, "wrong code");
     assert_eq!(right.headers, wrong.headers, "indistinguishable");
-    assert_eq!(pool.usage(), usage, "no password check");
-    let held = [pool.try_slot().unwrap(), pool.try_slot().unwrap()];
-    banned(
-        &send(&app, login_req(&f, PW, IP)).await,
-        "429 before the password slots (not 503)",
-    );
-    drop(held);
+    let user = o
+        .users()
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|u| u.email == TEST_USER)
+        .unwrap();
+    assert!(user.code_expires_at.is_some(), "code not used up");
     // No other side effect either: no registration, no authorization page.
     let clients = std::fs::read(dir.join("oauth-clients.json")).unwrap();
     let reg = Request::post("/oauth/register")

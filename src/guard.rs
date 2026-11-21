@@ -8,8 +8,9 @@
 //! - body size cap, request timeout, global concurrency cap ([`protect`]).
 //!
 //! What counts as an authentication failure: a wrong or unknown bearer token,
-//! a wrong owner password, a wrong client secret or client assertion, a wrong
-//! PKCE verifier for a live code, and whatever the app reports through the
+//! a refused enrolment code (unknown address, wrong, expired or used code),
+//! a wrong client secret or client assertion, a wrong PKCE verifier for a
+//! live code, and whatever the app reports through the
 //! [`AuthFailures`] request extension that [`protect`] inserts (or through
 //! [`Guard::auth_failed`] on a clone of the same [`Guard`]): a wrong URL path
 //! token, a wrong device token, ... While an IP is banned, its failures are
@@ -32,7 +33,7 @@
 //! [`authenticated`]) goes back; anything else becomes 429 (fail closed:
 //! routes that do not authenticate, 404s, 405s and extractor rejections
 //! included). The crate marks a valid bearer token and a successful token
-//! request; it never checks the owner password for a banned IP (see the
+//! request; it never checks an enrolment code for a banned IP (see the
 //! threat model in `docs/threat-model.md`).
 //!
 //! Client IP: `CF-Connecting-IP` (set by Cloudflare; the front is assumed to
@@ -331,8 +332,8 @@ impl AuthFailures {
     /// Whether the IP was banned when the request was admitted (only seen
     /// by handlers with [`Limits::serve_authenticated_when_banned`]): the
     /// response goes back only if marked [`Authenticated`], so a handler may
-    /// skip work it would not mark (the crate never checks the owner
-    /// password for a banned IP).
+    /// skip work it would not mark (the crate never checks an enrolment
+    /// code for a banned IP).
     pub fn banned(&self) -> bool {
         self.banned
     }

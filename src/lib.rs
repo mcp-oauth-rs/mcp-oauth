@@ -1,17 +1,22 @@
-//! OAuth 2.1 for a single-owner MCP server: the server is its own
-//! authorization server and its own protected resource, and one owner
-//! password guards the consent screen. Nothing here knows about the tools
-//! the server offers. The API:
+//! OAuth 2.1 for an MCP server: the server is its own authorization server
+//! and its own protected resource. Users on an allowlist of e-mail
+//! addresses sign in with a single-use enrolment code an administrator gave
+//! them, and every grant carries the user's address; a single-owner server
+//! is an allowlist of one address. Nothing here knows about the tools the
+//! server offers. The API:
 //!
 //! - [`Config`] and [`OAuth::new`] (validates the config, loads persisted
-//!   clients and tokens from `state_dir`);
-//! - [`OAuth::router`]: the well-known metadata, `/oauth/authorize` (login
+//!   clients, tokens and users from `state_dir`);
+//! - [`Users`]: the admin API for a command-line tool (allow an address,
+//!   issue an enrolment code, revoke, list), also reachable as
+//!   [`OAuth::users`];
+//! - [`OAuth::router`]: the well-known metadata, `/oauth/authorize` (sign-in
 //!   and consent pages), `/oauth/token`, `/oauth/register`, `/oauth/revoke`;
 //!   merge it into the app;
 //! - [`OAuth::bearer_layer`]: protects any route; a valid token puts a
-//!   [`Grant`] in the request extensions, anything else gets 401 with
+//!   [`Grant`] (client, scope, the user's address as [`Grant::subject`]) in
+//!   the request extensions, anything else gets 401 with
 //!   `WWW-Authenticate: Bearer resource_metadata="..."`;
-//! - [`hash_password`]: argon2id PHC string for [`Config::owner_password_hash`];
 //! - [`protect`] with a [`Guard`]: per-IP rate limit, ban after repeated
 //!   authentication failures, body limit, timeout, concurrency cap; unknown
 //!   paths are not counted as failures unless [`Limits::count_unknown_path`]
@@ -33,23 +38,33 @@
 //! section 7.3).
 //!
 //! ```no_run
-//! use axum::{Router, routing::any};
-//! use mcp_oauth_server::{Config, Guard, Limits, OAuth, protect};
+//! use axum::{Extension, Router, routing::any};
+//! use mcp_oauth_server::{Config, Grant, Guard, Limits, OAuth, Users, protect};
 //!
 //! # fn app() -> Result<Router, String> {
 //! let oauth = OAuth::new(Config {
 //!     issuer: "https://mcp.example.net".into(),
 //!     mcp_path: "/mcp".into(),
-//!     owner_password_hash: std::env::var("OWNER_PASSWORD_HASH").map_err(|e| e.to_string())?,
 //!     state_dir: "/state".into(),
 //!     redirect_patterns: mcp_oauth_server::DEFAULT_REDIRECT_PATTERNS.iter().map(|s| s.to_string()).collect(),
 //!     resource_name: "my-server".into(),
-//!     cimd_allowlist: None,
+//!     ..Default::default()
 //! })?;
+//! let mcp = any(|Extension(g): Extension<Grant>| async move {
+//!     format!("hello {}", g.subject.unwrap_or_default())
+//! });
 //! let app = Router::new()
-//!     .route("/mcp", any(|| async { "MCP here" }).layer(oauth.bearer_layer()))
+//!     .route("/mcp", mcp.layer(oauth.bearer_layer()))
 //!     .merge(oauth.router());
 //! Ok(protect(app, Guard::new(Limits::default())))
+//! # }
+//!
+//! // The admin command (`my-server enrol <address>`): print a code once.
+//! # fn enrol(email: &str) -> Result<(), String> {
+//! let users = Users::open("/state")?;
+//! users.allow(email)?;
+//! println!("{}", users.enrol_code(email)?);
+//! # Ok(())
 //! # }
 //! ```
 
@@ -57,10 +72,12 @@ mod cimd;
 mod guard;
 mod jwt;
 mod oauth;
-mod password;
+mod users;
 
 #[cfg(test)]
 mod flow_tests;
+#[cfg(test)]
+mod sign_in_tests;
 #[cfg(test)]
 mod test_https;
 
@@ -70,6 +87,6 @@ pub use guard::{
 };
 pub use oauth::{
     ACCESS_TTL, BearerLayer, BearerService, Config, DEFAULT_REDIRECT_PATTERNS, Grant, OAuth,
-    REFRESH_TTL, check_pattern, hash_password,
+    REFRESH_TTL, check_pattern,
 };
-pub use password::DEFAULT_MAX_PASSWORD_CHECKS;
+pub use users::{ENROL_CODE_TTL, User, Users, normalize_email};

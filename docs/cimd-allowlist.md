@@ -37,7 +37,7 @@ hold:
 - `true` (the default): their access tokens keep validating and a DCR
   client keeps rotating its refresh token (still authenticating with its
   secret if it has one), so existing connections do not break. The grace ends
-  when a refresh token expires (`REFRESH_TTL`, 30 days without use) or is
+  when a refresh token expires (`REFRESH_TTL`, 180 days without use) or is
   revoked; the client then has to connect again, through CIMD. A CIMD client
   outside the list cannot refresh (its document is refused), so its access
   token simply runs out (`ACCESS_TTL`).
@@ -48,3 +48,4 @@ hold:
 At start the server logs `oauth: dynamic client registration closed (N
 allowlisted client_id URLs); M token families of other clients kept ...`, and
 `with_dcr_grace(false)` logs how many families it cuts off.
+

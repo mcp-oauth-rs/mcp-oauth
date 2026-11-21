@@ -67,9 +67,9 @@ Learned on live connections and from the published metadata documents:
 - Authorization code + PKCE S256 for every client; `resource` (RFC 8707)
   checked when present, tokens bound to the MCP URL; `iss` in every
   authorization response (RFC 9207).
-- Refresh tokens rotate on every use, 30 days; access tokens are opaque 32
-  random bytes, 1 h. Replaying a used code or a rotated-out refresh token
-  revokes the grant. Revocation (RFC 7009).
+- Refresh tokens rotate on every use, 180 days (`OAuth::with_refresh_ttl`);
+  access tokens are opaque 32 random bytes, 1 h. Replaying a used code or a
+  rotated-out refresh token revokes the grant. Revocation (RFC 7009).
 - Redirect patterns: scheme and host match exactly, `:*` any port, a trailing
   `*` any rest of the path (no `..` or encoded `.` `/` `\`); https only, http
   only on loopback. `DEFAULT_REDIRECT_PATTERNS`: Claude
@@ -77,3 +77,4 @@ Learned on live connections and from the published metadata documents:
   Claude Code (`http://localhost:*/callback`, `http://127.0.0.1:*/callback`),
   ChatGPT (`https://chatgpt.com/connector_platform_oauth_redirect` and `/*`,
   `https://chatgpt.com/aip/*`, `https://chat.openai.com/...`).
+

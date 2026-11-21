@@ -3,13 +3,14 @@
 //! Secrets at rest: only SHA-256 digests of access and refresh tokens are
 //! stored (`oauth-tokens.json`); clients registered by DCR (with the SHA-256
 //! digest of their client secret, if any) are in `oauth-clients.json`; both
-//! are written atomically with mode 600. Codes, login tickets, CIMD documents
-//! and assertion `jti`s live in memory.
+//! are written atomically with mode 600. The allowlist and the enrolment
+//! codes (as digests) are in `oauth-users.json` (see [`crate::Users`]).
+//! Codes, login tickets, CIMD documents and assertion `jti`s live in memory.
 
 use crate::cimd::{AuthMethod, Cimd, CimdError};
 use crate::guard::{AuthFailures, authenticated, banned_response, serve_when_banned};
 use crate::jwt;
-use crate::password::{DEFAULT_MAX_PASSWORD_CHECKS, OwnerPassword};
+use crate::users::{Refused, Users};
 use axum::{
     Extension, Router,
     body::Bytes,
@@ -26,14 +27,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 pub const ACCESS_TTL: u64 = 3600;
-pub const REFRESH_TTL: u64 = 30 * 86400;
+/// Refresh token lifetime, renewed at every refresh: 180 days (see
+/// [`OAuth::with_refresh_ttl`]).
+pub const REFRESH_TTL: u64 = 180 * 86400;
 const CODE_TTL: u64 = 300;
 const TICKET_TTL: u64 = 600;
 const MAX_CLIENTS: usize = 512;
@@ -63,16 +66,18 @@ pub const DEFAULT_REDIRECT_PATTERNS: &[&str] = &[
     "https://chat.openai.com/aip/*",
 ];
 
-#[derive(Clone, Debug)]
+/// Server configuration. `Default` gives empty values, invalid until filled
+/// in; a literal may leave out the optional fields (`cimd_allowlist`, and
+/// fields added later) with `..Default::default()`.
+#[derive(Clone, Debug, Default)]
 pub struct Config {
     /// Public origin, e.g. `https://mcp.example.net` (no trailing slash). It
     /// is the issuer; the protected resource is `issuer + mcp_path`.
     pub issuer: String,
     /// Path of the bearer-protected MCP route, e.g. `/mcp`.
     pub mcp_path: String,
-    /// Argon2id PHC string of the single owner's password.
-    pub owner_password_hash: String,
-    /// Directory for `oauth-clients.json` and `oauth-tokens.json`.
+    /// Directory for `oauth-clients.json`, `oauth-tokens.json` and
+    /// `oauth-users.json` (the allowlist, see [`crate::Users`]).
     pub state_dir: PathBuf,
     /// Redirect URIs a client may use, by DCR or in its Client ID Metadata
     /// Document (see [`DEFAULT_REDIRECT_PATTERNS`]).
@@ -91,10 +96,17 @@ pub struct Config {
 }
 
 /// What a valid bearer token grants; inserted into request extensions.
+/// Fields may be added in later versions (`#[non_exhaustive]`): read them,
+/// do not build or destructure a `Grant` exhaustively.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Grant {
     pub client_id: String,
     pub scope: String,
+    /// Who signed in: the user's e-mail address, normalised (trimmed, lower
+    /// case). Always `Some` in a grant this version honours; an `Option` so
+    /// that a later sign-in method without an address stays possible.
+    pub subject: Option<String>,
 }
 
 pub fn unix_now() -> u64 {
@@ -110,17 +122,8 @@ fn random_token(n: usize) -> String {
     B64.encode(b)
 }
 
-fn digest(s: &str) -> String {
+pub(crate) fn digest(s: &str) -> String {
     hex::encode(Sha256::digest(s.as_bytes()))
-}
-
-/// argon2id (v19, default OWASP parameters m=19 MiB, t=2, p=1) PHC string.
-pub fn hash_password(password: &str) -> Result<String, String> {
-    use argon2::PasswordHasher;
-    argon2::Argon2::default()
-        .hash_password(password.as_bytes())
-        .map(|h| h.to_string())
-        .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------- PKCE
@@ -482,7 +485,20 @@ struct Family {
     refresh_exp: u64,
     /// SHA-256 hex of rotated-out refresh tokens (reuse detection).
     retired: Vec<String>,
+    /// The user's address (see [`Grant::subject`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subject: Option<String>,
+    /// The user's generation when the family was issued; a revocation
+    /// increments it (see [`crate::Users::revoke`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    generation: Option<u64>,
+    /// Refresh token lifetime when it is not [`REFRESH_TTL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_ttl: Option<u64>,
 }
+
+/// The user a grant is issued to: address and generation.
+type Subject = Option<(String, u64)>;
 
 #[derive(Debug, PartialEq)]
 pub struct Issued {
@@ -502,7 +518,8 @@ pub enum RefreshError {
 
 #[derive(Debug, PartialEq)]
 enum Access {
-    Valid(Grant),
+    /// The grant, and the user's generation.
+    Valid(Grant, Option<u64>),
     /// Issued here but expired or bound to another resource.
     Stale,
     Unknown,
@@ -573,9 +590,25 @@ impl TokenStore {
         }
     }
 
+    #[cfg(test)]
     fn issue(&mut self, client_id: &str, scope: &str, resource: &str, now: u64) -> Issued {
+        self.issue_for(client_id, scope, resource, now, None, REFRESH_TTL)
+    }
+
+    /// A new family for `client_id` and `subject`,
+    /// whose refresh tokens live `refresh_ttl` seconds from each rotation.
+    fn issue_for(
+        &mut self,
+        client_id: &str,
+        scope: &str,
+        resource: &str,
+        now: u64,
+        subject: Subject,
+        refresh_ttl: u64,
+    ) -> Issued {
         self.prune(now);
         let (access, refresh) = (random_token(32), random_token(32));
+        let (subject, generation) = subject.unzip();
         let f = Family {
             id: random_token(12),
             client_id: client_id.into(),
@@ -585,8 +618,11 @@ impl TokenStore {
             access: digest(&access),
             access_exp: now + ACCESS_TTL,
             refresh: digest(&refresh),
-            refresh_exp: now + REFRESH_TTL,
+            refresh_exp: now + refresh_ttl,
             retired: Vec::new(),
+            subject,
+            generation,
+            refresh_ttl: (refresh_ttl != REFRESH_TTL).then_some(refresh_ttl),
         };
         let issued = Issued {
             access_token: access,
@@ -603,7 +639,7 @@ impl TokenStore {
     #[cfg(test)]
     fn access(&self, token: &str, resource: &str, now: u64) -> Option<Grant> {
         match self.lookup(token, resource, now) {
-            Access::Valid(g) => Some(g),
+            Access::Valid(g, _) => Some(g),
             _ => None,
         }
     }
@@ -619,17 +655,34 @@ impl TokenStore {
             return Access::Unknown;
         };
         if f.access_exp > now && f.resource == resource {
-            Access::Valid(Grant {
-                client_id: f.client_id.clone(),
-                scope: f.scope.clone(),
-            })
+            Access::Valid(
+                Grant {
+                    client_id: f.client_id.clone(),
+                    scope: f.scope.clone(),
+                    subject: f.subject.clone(),
+                },
+                f.generation,
+            )
         } else {
             Access::Stale
         }
     }
 
     /// Rotate: new access + refresh token, the presented one is retired.
+    #[cfg(test)]
     fn refresh(&mut self, token: &str, client_id: &str, now: u64) -> Result<Issued, RefreshError> {
+        self.refresh_if(token, client_id, now, |_| true)
+    }
+
+    /// [`Self::refresh`] for a family that `honoured` accepts; a family it
+    /// refuses (its user was revoked) is removed.
+    fn refresh_if(
+        &mut self,
+        token: &str,
+        client_id: &str,
+        now: u64,
+        honoured: impl Fn(&Family) -> bool,
+    ) -> Result<Issued, RefreshError> {
         let h = digest(token);
         if let Some(id) = self.by_retired.get(&h).cloned() {
             eprintln!("oauth: refresh token reuse, revoking family {id}");
@@ -642,6 +695,10 @@ impl TokenStore {
             .cloned()
             .ok_or(RefreshError::Invalid)?;
         let mut f = self.remove(&id).ok_or(RefreshError::Invalid)?;
+        if !honoured(&f) {
+            eprintln!("oauth: refresh for a revoked user, removing family {id}");
+            return Err(RefreshError::Invalid);
+        }
         if f.refresh_exp <= now || f.client_id != client_id {
             if f.refresh_exp > now {
                 self.insert(f);
@@ -656,7 +713,7 @@ impl TokenStore {
         }
         f.access = digest(&access);
         f.access_exp = now + ACCESS_TTL;
-        f.refresh_exp = now + REFRESH_TTL;
+        f.refresh_exp = now + f.refresh_ttl.unwrap_or(REFRESH_TTL);
         let issued = Issued {
             access_token: access,
             refresh_token: refresh,
@@ -688,7 +745,7 @@ impl TokenStore {
 // ---------------------------------------------------------- persistence
 
 /// Atomic write: temp file (mode 600) + fsync + rename + directory fsync.
-fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(dir: &Path, name: &str, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = dir.join(format!(".{name}.tmp"));
@@ -737,22 +794,27 @@ struct PendingAuth {
     state: Option<String>,
     scope: String,
     exp: u64,
+    /// Who signed in (set by the login step).
+    subject: Subject,
 }
 
 struct Inner {
     cfg: Config,
     resource: String,
     cimd: Cimd,
-    password: Arc<OwnerPassword>,
+    /// The allowlist and enrolment codes the login step checks.
+    users: Users,
     /// See [`OAuth::with_dcr_grace`].
     dcr_grace: AtomicBool,
+    /// See [`OAuth::with_refresh_ttl`].
+    refresh_ttl: AtomicU64,
     st: Mutex<St>,
 }
 
 struct St {
     clients: HashMap<String, Client>,
     tokens: TokenStore,
-    /// Login tickets (digest -> request), issued after a correct password.
+    /// Login tickets (digest -> request), issued after a valid enrolment code.
     tickets: HashMap<String, PendingAuth>,
     /// Authorization codes (digest -> request).
     codes: HashMap<String, PendingAuth>,
@@ -768,7 +830,12 @@ pub struct OAuth(Arc<Inner>);
 
 impl OAuth {
     /// Validate `cfg`, create the state directory (mode 700) if needed and
-    /// load the persisted clients and tokens.
+    /// load the persisted clients, tokens and users. The login page asks
+    /// for an allowlisted e-mail address and a single-use enrolment code
+    /// (see [`Users`], whose admin API manages both in `state_dir`); every
+    /// grant carries the address as [`Grant::subject`], and revoking a user
+    /// cuts their tokens at once. A single-owner server is an allowlist of
+    /// one address.
     pub fn new(cfg: Config) -> Result<Self, String> {
         let cimd = Cimd::new(cfg.redirect_patterns.clone())?;
         Self::with_cimd(cfg, cimd)
@@ -798,10 +865,6 @@ impl OAuth {
         if !cfg.mcp_path.starts_with('/') {
             return Err(format!("mcp_path must start with /, got {}", cfg.mcp_path));
         }
-        let password = Arc::new(OwnerPassword::new(
-            &cfg.owner_password_hash,
-            DEFAULT_MAX_PASSWORD_CHECKS,
-        )?);
         if cfg.redirect_patterns.is_empty() {
             return Err("no redirect URI patterns".into());
         }
@@ -820,6 +883,7 @@ impl OAuth {
                 .create(&cfg.state_dir)
                 .map_err(|e| format!("{}: {e}", cfg.state_dir.display()))?;
         }
+        let users = Users::open(&cfg.state_dir)?;
         let clients: ClientsFile = read_json(&cfg.state_dir, CLIENTS_FILE)?;
         let tokens: TokensFile = read_json(&cfg.state_dir, TOKENS_FILE)?;
         let mut tokens = TokenStore::from_families(tokens.families);
@@ -835,6 +899,13 @@ impl OAuth {
                  {outside} token families of other clients kept until their refresh \
                  tokens expire, unless dcr_grace is turned off",
                 l.len(),
+            );
+        }
+        let unowned = tokens.fams.values().filter(|f| f.subject.is_none()).count();
+        if unowned > 0 {
+            eprintln!(
+                "oauth: {unowned} token families from version 0.1 have no user and are not \
+                 honoured; adopt_unowned_grants(<owner address>) keeps them"
             );
         }
         let resource = format!("{}{}", cfg.issuer, cfg.mcp_path);
@@ -854,10 +925,72 @@ impl OAuth {
             cfg,
             resource,
             cimd,
-            password,
+            users,
             dcr_grace: AtomicBool::new(true),
+            refresh_ttl: AtomicU64::new(REFRESH_TTL),
             st: Mutex::new(st),
         })))
+    }
+
+    /// Lifetime of the refresh tokens issued from now on, in seconds,
+    /// renewed at every refresh (minimum [`ACCESS_TTL`]; default
+    /// [`REFRESH_TTL`], 180 days). Grants issued earlier keep the lifetime
+    /// they were issued with.
+    pub fn with_refresh_ttl(self, secs: u64) -> Self {
+        self.0
+            .refresh_ttl
+            .store(secs.max(ACCESS_TTL), Ordering::Relaxed);
+        self
+    }
+
+    /// See [`Self::with_refresh_ttl`].
+    pub fn refresh_ttl(&self) -> u64 {
+        self.0.refresh_ttl.load(Ordering::Relaxed)
+    }
+
+    /// The allowlist and enrolment codes (the same store as [`Users::open`]
+    /// on `state_dir`).
+    pub fn users(&self) -> &Users {
+        &self.0.users
+    }
+
+    /// Migration from version 0.1 (one owner password): its token families
+    /// carry no user, so they are not honoured. This gives every such
+    /// family to `email`, the former owner's address, which must be active
+    /// on the allowlist: the connections the owner already has keep working
+    /// without signing in again. Returns how many families were adopted;
+    /// calling it at every start is harmless (later calls find none).
+    pub fn adopt_unowned_grants(&self, email: &str) -> Result<usize, String> {
+        let email = crate::users::normalize_email(email)?;
+        let generation = self
+            .0
+            .users
+            .active_generation(&email)?
+            .ok_or_else(|| format!("{email} is not active on the allowlist; allow it first"))?;
+        let mut st = self.lock();
+        let mut n = 0;
+        for f in st.tokens.fams.values_mut() {
+            if f.subject.is_none() {
+                f.subject = Some(email.clone());
+                f.generation = Some(generation);
+                n += 1;
+            }
+        }
+        if n > 0 {
+            self.save_tokens(&st);
+            eprintln!("oauth: {n} token families from version 0.1 adopted by {email}");
+        }
+        Ok(n)
+    }
+
+    /// Whether tokens issued to `subject` under `generation` are honoured:
+    /// only while the user is active with the same generation (not revoked
+    /// since). Families without a user (version 0.1) are not.
+    fn user_honoured(&self, subject: Option<&str>, generation: Option<u64>) -> bool {
+        match (subject, generation) {
+            (Some(email), Some(generation)) => self.0.users.current(email, generation),
+            _ => false,
+        }
     }
 
     /// Only matters with a [`Config::cimd_allowlist`]. `true` (the default):
@@ -890,23 +1023,6 @@ impl OAuth {
         self.0.dcr_grace.load(Ordering::Relaxed)
     }
 
-    /// At most `n` owner password checks run at once (default
-    /// [`DEFAULT_MAX_PASSWORD_CHECKS`], minimum 1); a sign-in beyond that is
-    /// answered at once with 503 and `Retry-After`, without checking the
-    /// password. Each check holds one argon2 working buffer (`m` KiB of the
-    /// owner password hash, 19 MiB for [`hash_password`]), allocated on first
-    /// use and kept for the next check: the password checks never take more
-    /// than `n` x `m` KiB.
-    pub fn with_max_password_checks(self, n: usize) -> Self {
-        self.0.password.set_max(n);
-        self
-    }
-
-    /// Owner password checks allowed at once (see [`Self::with_max_password_checks`]).
-    pub fn max_password_checks(&self) -> usize {
-        self.0.password.max()
-    }
-
     /// Tests: an instance whose CIMD documents come from memory.
     #[cfg(test)]
     pub(crate) fn new_for_tests(cfg: Config) -> Result<Self, String> {
@@ -917,11 +1033,6 @@ impl OAuth {
     #[cfg(test)]
     pub(crate) fn cimd(&self) -> &Cimd {
         &self.0.cimd
-    }
-
-    #[cfg(test)]
-    pub(crate) fn password_pool(&self) -> &Arc<OwnerPassword> {
-        &self.0.password
     }
 
     /// Whether Dynamic Client Registration is open (no CIMD allowlist).
@@ -943,14 +1054,20 @@ impl OAuth {
         self.dcr_grace() || self.cimd_allowed(client_id)
     }
 
-    /// Bearer lookup, with the allowlist applied to the token's client.
+    /// Bearer lookup, with the allowlist applied to the token's client and,
+    /// the revocations to its user.
     fn lookup(&self, token: &str) -> Access {
-        match self
+        let found = self
             .lock()
             .tokens
-            .lookup(token, &self.0.resource, unix_now())
-        {
-            Access::Valid(g) if !self.tokens_honoured(&g.client_id) => Access::Stale,
+            .lookup(token, &self.0.resource, unix_now());
+        match found {
+            Access::Valid(g, _) if !self.tokens_honoured(&g.client_id) => Access::Stale,
+            Access::Valid(g, generation)
+                if !self.user_honoured(g.subject.as_deref(), generation) =>
+            {
+                Access::Stale
+            }
             a => a,
         }
     }
@@ -967,7 +1084,7 @@ impl OAuth {
     /// Grant for a bearer access token, if valid for this resource now.
     pub fn validate(&self, token: &str) -> Option<Grant> {
         match self.lookup(token) {
-            Access::Valid(g) => Some(g),
+            Access::Valid(g, _) => Some(g),
             _ => None,
         }
     }
@@ -989,7 +1106,7 @@ impl OAuth {
     fn authenticate(&self, h: &HeaderMap) -> Result<Grant, BearerRejection> {
         let found = bearer(h).map(|t| self.lookup(t));
         match found {
-            Some(Access::Valid(g)) => Ok(g),
+            Some(Access::Valid(g, _)) => Ok(g),
             Some(Access::Unknown) => Err(BearerRejection {
                 invalid: true,
                 count: true,
@@ -1311,7 +1428,9 @@ struct AuthzForm {
     #[serde(flatten)]
     p: AuthzParams,
     step: Option<String>,
-    password: Option<String>,
+    /// The login step: the address and the enrolment code.
+    email: Option<String>,
+    code: Option<String>,
     ticket: Option<String>,
     decision: Option<String>,
 }
@@ -1439,6 +1558,7 @@ impl OAuth {
             state: p.state.clone(),
             scope: SCOPE.into(),
             exp: now,
+            subject: None,
         };
         Checked::Ok(pending, label)
     }
@@ -1488,9 +1608,10 @@ async fn authorize_get(
     match o.check_authz(&p, unix_now()).await {
         Checked::Page(s, m) => error_page(s, &m),
         Checked::Redirect(r) => r,
-        Checked::Ok(pending, label) => {
-            html(StatusCode::OK, &login_page(&o, &p, &pending, &label, None))
-        }
+        Checked::Ok(pending, label) => html(
+            StatusCode::OK,
+            &login_page(&o, &p, &pending, &label, None, None),
+        ),
     }
 }
 
@@ -1501,9 +1622,6 @@ fn record_failure(f: &Option<Extension<AuthFailures>>, what: &str) {
         f.record(what);
     }
 }
-
-const BUSY: &str = "Too many sign-ins in progress, try again in a few seconds.";
-const BUSY_RETRY_AFTER: &str = "2";
 
 async fn authorize_post(
     State(o): State<OAuth>,
@@ -1516,57 +1634,18 @@ async fn authorize_post(
     };
     let now = unix_now();
     match f.step.as_deref() {
-        // Never check the owner password for a banned IP: its answer (429
-        // for a wrong password, the consent page for the right one) would
-        // turn the ban into a password oracle at the token bucket rate.
+        // Never check an enrolment code for a banned IP: its answer (429
+        // for a wrong code, the consent page for the right one) would turn
+        // the ban into an oracle at the token bucket rate, and a right code
+        // would be used up for nothing.
         Some("login") if banned(&failures) => banned_response(),
         Some("login") => {
-            let (mut pending, label) = match o.check_authz(&f.p, now).await {
+            let (pending, label) = match o.check_authz(&f.p, now).await {
                 Checked::Page(s, m) => return error_page(s, &m),
                 Checked::Redirect(r) => return r,
                 Checked::Ok(p, n) => (p, n),
             };
-            // Bounded: at most max_password_checks argon2 runs (19 MiB each)
-            // at once; beyond that answer now, without queueing.
-            let Some(slot) = o.0.password.try_slot() else {
-                eprintln!("oauth: owner password check refused, all slots busy");
-                let mut r = html(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &login_page(&o, &f.p, &pending, &label, Some(BUSY)),
-                );
-                r.headers_mut().insert(
-                    header::RETRY_AFTER,
-                    HeaderValue::from_static(BUSY_RETRY_AFTER),
-                );
-                return r;
-            };
-            let pw = f.password.unwrap_or_default();
-            // The slot moves into the blocking task: it is released when
-            // argon2 is done, even if this request is cancelled meanwhile.
-            let ok = tokio::task::spawn_blocking(move || slot.verify(&pw))
-                .await
-                .unwrap_or(false);
-            if !ok {
-                record_failure(&failures, "oauth password");
-                return html(
-                    StatusCode::UNAUTHORIZED,
-                    &login_page(&o, &f.p, &pending, &label, Some("Wrong password.")),
-                );
-            }
-            pending.exp = now + TICKET_TTL;
-            let ticket = random_token(32);
-            {
-                let mut st = o.lock();
-                st.tickets.retain(|_, t| t.exp > now);
-                if st.tickets.len() >= MAX_PENDING {
-                    return error_page(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "Too many pending sign-ins, try again later.",
-                    );
-                }
-                st.tickets.insert(digest(&ticket), pending.clone());
-            }
-            html(StatusCode::OK, &consent_page(&o, &pending, &label, &ticket))
+            o.user_login(f, pending, label, &failures, now).await
         }
         Some("consent") => {
             let pending = {
@@ -1580,23 +1659,108 @@ async fn authorize_post(
                     "This sign-in has expired. Start again from the client.",
                 );
             };
-            // A live ticket (256 random bits, issued after the right
-            // password) authenticates the owner.
+            // A live ticket (256 random bits, issued after a valid
+            // enrolment code) authenticates the user.
             authenticated(o.consent(pending, f.decision.as_deref(), now))
         }
         _ => error_page(StatusCode::BAD_REQUEST, "Malformed form."),
     }
 }
 
+const TOO_MANY_SIGN_INS: &str = "Too many pending sign-ins, try again later.";
+const CODE_REFUSED: &str = "Unknown address, or wrong, expired or already used code.";
+
 impl OAuth {
-    /// The owner's decision on a live sign-in ticket.
+    /// After a successful login: a sign-in ticket and the consent page.
+    fn ticket(&self, mut pending: PendingAuth, label: &ClientLabel, now: u64) -> Response {
+        pending.exp = now + TICKET_TTL;
+        let ticket = random_token(32);
+        {
+            let mut st = self.lock();
+            st.tickets.retain(|_, t| t.exp > now);
+            if st.tickets.len() >= MAX_PENDING {
+                return error_page(StatusCode::SERVICE_UNAVAILABLE, TOO_MANY_SIGN_INS);
+            }
+            st.tickets.insert(digest(&ticket), pending.clone());
+        }
+        html(
+            StatusCode::OK,
+            &consent_page(self, &pending, label, &ticket),
+        )
+    }
+
+    /// The login step: an allowlisted address and its enrolment
+    /// code, consumed on success. Every refusal counts as an authentication
+    /// failure and gets the same answer (no hint of which addresses are
+    /// allowlisted or which codes exist).
+    async fn user_login(
+        &self,
+        f: AuthzForm,
+        mut pending: PendingAuth,
+        label: ClientLabel,
+        failures: &Option<Extension<AuthFailures>>,
+        now: u64,
+    ) -> Response {
+        let email = f.email.unwrap_or_default();
+        let code = f.code.unwrap_or_default();
+        // Do not consume a code that could not be followed by a ticket.
+        {
+            let mut st = self.lock();
+            st.tickets.retain(|_, t| t.exp > now);
+            if st.tickets.len() >= MAX_PENDING {
+                return error_page(StatusCode::SERVICE_UNAVAILABLE, TOO_MANY_SIGN_INS);
+            }
+        }
+        // File lock and I/O: off the async workers.
+        let users = self.0.users.clone();
+        let typed = email.clone();
+        let res = tokio::task::spawn_blocking(move || users.redeem(&typed, &code, now))
+            .await
+            .unwrap_or_else(|e| Err(Refused::Io(format!("enrolment code check failed: {e}"))));
+        match res {
+            Ok((subject, generation)) => {
+                eprintln!(
+                    "oauth: {subject} signed in with an enrolment code for client {}",
+                    pending.client_id
+                );
+                pending.subject = Some((subject, generation));
+                self.ticket(pending, &label, now)
+            }
+            Err(Refused::Io(e)) => {
+                eprintln!("oauth: enrolment code not checked: {e}");
+                error_page(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Sign-in is unavailable right now, try again later.",
+                )
+            }
+            Err(why) => {
+                // Typed by anyone: logged escaped and cut short.
+                let shown: String = email.chars().take(100).collect();
+                eprintln!("oauth: enrolment code refused for {shown:?}: {why}");
+                record_failure(failures, "oauth enrolment code");
+                html(
+                    StatusCode::UNAUTHORIZED,
+                    &login_page(
+                        self,
+                        &f.p,
+                        &pending,
+                        &label,
+                        Some(CODE_REFUSED),
+                        Some(&email),
+                    ),
+                )
+            }
+        }
+    }
+
+    /// The signed-in user's decision on a live sign-in ticket.
     fn consent(&self, mut pending: PendingAuth, decision: Option<&str>, now: u64) -> Response {
         if decision != Some("allow") {
             return self.redirect(
                 &pending.redirect_uri,
                 &[
                     ("error", "access_denied"),
-                    ("error_description", "the owner denied access"),
+                    ("error_description", "the user denied access"),
                 ],
                 pending.state.as_deref(),
             );
@@ -1615,7 +1779,8 @@ impl OAuth {
             }
             st.codes.insert(digest(&code), pending.clone());
         }
-        eprintln!("oauth: owner authorized client {}", pending.client_id);
+        let who = pending.subject.as_ref().map_or("?", |(s, _)| s.as_str());
+        eprintln!("oauth: {who} authorized client {}", pending.client_id);
         self.redirect(
             &pending.redirect_uri,
             &[("code", &code)],
@@ -1976,16 +2141,35 @@ async fn token(
                 record_failure(&failures, "oauth PKCE verifier");
                 return grant("PKCE verification failed");
             }
+            // The user may have been revoked since the
+            // sign-in (the code is burnt either way).
+            if !o.user_honoured(
+                p.subject.as_ref().map(|(s, _)| s.as_str()),
+                p.subject.as_ref().map(|s| s.1),
+            ) {
+                return grant("access revoked");
+            }
             let resource = o.0.resource.clone();
-            let issued = st.tokens.issue(&client_id, &p.scope, &resource, now);
+            let issued = st.tokens.issue_for(
+                &client_id,
+                &p.scope,
+                &resource,
+                now,
+                p.subject.clone(),
+                o.refresh_ttl(),
+            );
             st.used_codes.insert(h, (issued.family.clone(), p.exp));
             o.save_tokens(&st);
             token_response(&issued)
         }
         Some("refresh_token") => {
-            let res = st
-                .tokens
-                .refresh(r.refresh_token.as_deref().unwrap_or(""), &client_id, now);
+            let families = st.tokens.fams.len();
+            let res = st.tokens.refresh_if(
+                r.refresh_token.as_deref().unwrap_or(""),
+                &client_id,
+                now,
+                |f| o.user_honoured(f.subject.as_deref(), f.generation),
+            );
             match res {
                 Ok(issued) => {
                     o.save_tokens(&st);
@@ -1995,7 +2179,13 @@ async fn token(
                     o.save_tokens(&st);
                     grant("refresh token reused; authorization revoked")
                 }
-                Err(RefreshError::Invalid) => grant("unknown or expired refresh token"),
+                Err(RefreshError::Invalid) => {
+                    // A family of a revoked user was removed.
+                    if st.tokens.fams.len() != families {
+                        o.save_tokens(&st);
+                    }
+                    grant("unknown or expired refresh token")
+                }
             }
         }
         _ => oerr(
@@ -2049,7 +2239,7 @@ const CSS: &str = "body{font:16px/1.5 system-ui,sans-serif;background:#f4f4f5;co
 display:flex;min-height:100vh;align-items:center;justify-content:center}\
 main{background:#fff;border-radius:12px;box-shadow:0 2px 12px #0002;padding:2rem;max-width:26rem;width:90%}\
 h1{font-size:1.3rem;margin:0 0 1rem}code{background:#f4f4f5;padding:.1rem .3rem;border-radius:4px}\
-label{display:block;margin:1rem 0 .3rem}input[type=password]{width:100%;box-sizing:border-box;padding:.6rem;\
+label{display:block;margin:1rem 0 .3rem}input[type=email],input.code{width:100%;box-sizing:border-box;padding:.6rem;\
 font-size:1rem;border:1px solid #d4d4d8;border-radius:8px}button{margin-top:1rem;padding:.6rem 1.2rem;font-size:1rem;\
 border:0;border-radius:8px;background:#18181b;color:#fff;cursor:pointer}button.secondary{background:#e4e4e7;color:#18181b}\
 .err{color:#b91c1c}.warn{color:#92400e;background:#fef3c7;padding:.5rem;border-radius:8px}";
@@ -2132,12 +2322,15 @@ started the connection yourself, e.g. from Claude Code.</p>",
     s
 }
 
+/// The login page: address and enrolment code (`email` refills the address
+/// after a refusal).
 fn login_page(
     o: &OAuth,
     p: &AuthzParams,
     pending: &PendingAuth,
     label: &ClientLabel,
     err: Option<&str>,
+    email: Option<&str>,
 ) -> String {
     let fields: String = [
         ("response_type", p.response_type.as_deref()),
@@ -2156,13 +2349,24 @@ fn login_page(
     let err = err
         .map(|e| format!("<p class=\"err\">{}</p>", esc(e)))
         .unwrap_or_default();
+    // The code is typed, never clicked: a link in an e-mail would be opened
+    // (and used up) by mail scanners that follow links.
+    let inputs = format!(
+        "<label for=\"em\">E-mail address</label><input id=\"em\" type=\"email\" name=\"email\" \
+value=\"{}\" autocomplete=\"username\" required{}>\
+<label for=\"cd\">Enrolment code</label><input id=\"cd\" class=\"code\" type=\"text\" name=\"code\" \
+placeholder=\"XXXX-XXXX-XXXX-XXXX\" autocomplete=\"one-time-code\" autocapitalize=\"characters\" \
+spellcheck=\"false\" required{}><p>The single-use code you were given, valid 24 hours.</p>",
+        esc(email.unwrap_or_default()),
+        if email.is_none() { " autofocus" } else { "" },
+        if email.is_some() { " autofocus" } else { "" },
+    );
     page(
         &format!("Sign in to {}", o.0.cfg.resource_name),
         &format!(
             "<h1>Sign in to {svc}</h1><p>{} asks to connect to {svc}.</p>{}{err}\
 <form method=\"post\" action=\"/oauth/authorize\">{fields}<input type=\"hidden\" name=\"step\" value=\"login\">\
-<label for=\"pw\">Owner password</label><input id=\"pw\" type=\"password\" name=\"password\" \
-autocomplete=\"current-password\" required autofocus><button type=\"submit\">Sign in</button></form>",
+{inputs}<button type=\"submit\">Sign in</button></form>",
             client_label(label, &pending.client_id),
             redirect_note(&pending.redirect_uri),
         ),
@@ -2174,10 +2378,15 @@ fn consent_page(o: &OAuth, pending: &PendingAuth, label: &ClientLabel, ticket: &
     page(
         "Allow access?",
         &format!(
-            "<h1>Allow access?</h1><p>{} will be able to use {svc} on your behalf.</p>{}\
+            "<h1>Allow access?</h1>{}<p>{} will be able to use {svc} on your behalf.</p>{}\
 <form method=\"post\" action=\"/oauth/authorize\"><input type=\"hidden\" name=\"step\" value=\"consent\">{}\
 <button type=\"submit\" name=\"decision\" value=\"allow\">Allow</button> \
 <button type=\"submit\" name=\"decision\" value=\"deny\" class=\"secondary\">Deny</button></form>",
+            pending
+                .subject
+                .as_ref()
+                .map(|(s, _)| format!("<p>Signed in as <b>{}</b>.</p>", esc(s)))
+                .unwrap_or_default(),
             client_label(label, &pending.client_id),
             redirect_note(&pending.redirect_uri),
             hidden("ticket", Some(ticket)),
@@ -2187,11 +2396,31 @@ fn consent_page(o: &OAuth, pending: &PendingAuth, label: &ClientLabel, ticket: &
 
 #[cfg(test)]
 impl OAuth {
-    /// Tests: issue tokens for `client_id` as if at time `now`.
+    /// Tests: issue tokens for `client_id` to [`tests::TEST_USER`] (allowed
+    /// on the way) as if at time `now`.
     pub(crate) fn issue_for_tests(&self, client_id: &str, now: u64) -> (String, String) {
+        self.0.users.allow(tests::TEST_USER).unwrap();
+        let generation = self
+            .0
+            .users
+            .active_generation(tests::TEST_USER)
+            .unwrap()
+            .unwrap();
         let mut st = self.lock();
         let resource = self.0.resource.clone();
-        let i = st.tokens.issue(client_id, SCOPE, &resource, now);
+        let user = Some((tests::TEST_USER.to_string(), generation));
+        let i = st
+            .tokens
+            .issue_for(client_id, SCOPE, &resource, now, user, REFRESH_TTL);
+        (i.access_token, i.refresh_token)
+    }
+
+    /// Tests: a token family as version 0.1 issued it (no user), saved.
+    pub(crate) fn unowned_grant_for_tests(&self, client_id: &str) -> (String, String) {
+        let mut st = self.lock();
+        let resource = self.0.resource.clone();
+        let i = st.tokens.issue(client_id, SCOPE, &resource, unix_now());
+        self.save_tokens(&st);
         (i.access_token, i.refresh_token)
     }
 }
@@ -2212,11 +2441,13 @@ pub(crate) mod tests {
         p
     }
 
-    pub(crate) fn config(dir: &Path, hash: &str) -> Config {
+    /// The user the test helpers sign in.
+    pub(crate) const TEST_USER: &str = "owner@example.org";
+
+    pub(crate) fn config(dir: &Path) -> Config {
         Config {
             issuer: "https://issuer.test".into(),
             mcp_path: "/mcp".into(),
-            owner_password_hash: hash.into(),
             state_dir: dir.to_path_buf(),
             redirect_patterns: DEFAULT_REDIRECT_PATTERNS
                 .iter()
@@ -2256,21 +2487,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn password_hash_roundtrip() {
-        let h = hash_password("correct horse battery staple").unwrap();
-        assert!(h.starts_with("$argon2id$v=19$"), "{h}");
-        let pw = Arc::new(OwnerPassword::new(&h, 1).unwrap());
-        assert!(
-            pw.try_slot()
-                .unwrap()
-                .verify("correct horse battery staple")
-        );
-        assert!(!pw.try_slot().unwrap().verify("correct horse battery stapl"));
-        assert!(OwnerPassword::new("$argon2i$v=19$m=16,t=2,p=1$c2FsdHNhbHQ$Zm9v", 1).is_err());
-        assert!(OwnerPassword::new("plain", 1).is_err());
-    }
-
-    #[test]
     fn token_issue_expiry_and_rotation() {
         let mut s = TokenStore::default();
         let r = "https://issuer.test/mcp";
@@ -2286,6 +2502,7 @@ pub(crate) mod tests {
         let g = Grant {
             client_id: "c1".into(),
             scope: "mcp".into(),
+            subject: None,
         };
         assert_eq!(s.access(&a.access_token, r, t0 + 3599), Some(g.clone()));
         assert_eq!(
@@ -2330,7 +2547,7 @@ pub(crate) mod tests {
             Err(RefreshError::Invalid)
         );
 
-        // Refresh tokens live 30 days from their issue.
+        // Refresh tokens live REFRESH_TTL from their issue.
         let c = s.issue("c1", "mcp", r, t0);
         assert_eq!(
             s.refresh(&c.refresh_token, "c1", t0 + REFRESH_TTL),
@@ -2342,6 +2559,65 @@ pub(crate) mod tests {
                 .is_ok()
         );
         assert_eq!(s.refresh("garbage", "c1", t0), Err(RefreshError::Invalid));
+    }
+
+    /// A family keeps the refresh lifetime and the subject it was issued
+    /// with; the default lifetime is not written; a family of version 0.1
+    /// (no subject, no generation) still loads.
+    #[test]
+    fn family_refresh_ttl_and_subject() {
+        let mut s = TokenStore::default();
+        let r = "https://issuer.test/mcp";
+        let t0 = 1_000_000;
+        let ttl = 400 * 86400;
+        let a = s.issue_for("c1", "mcp", r, t0, Some(("ada@example.org".into(), 3)), ttl);
+        let fam = &s.fams[&a.family];
+        assert_eq!((fam.refresh_exp, fam.refresh_ttl), (t0 + ttl, Some(ttl)));
+        assert_eq!(
+            s.lookup(&a.access_token, r, t0),
+            Access::Valid(
+                Grant {
+                    client_id: "c1".into(),
+                    scope: "mcp".into(),
+                    subject: Some("ada@example.org".into()),
+                },
+                Some(3)
+            )
+        );
+        // Still alive after the default lifetime, rotated with its own.
+        let b = s
+            .refresh(&a.refresh_token, "c1", t0 + REFRESH_TTL + 10)
+            .unwrap();
+        assert_eq!(s.fams[&b.family].refresh_exp, t0 + REFRESH_TTL + 10 + ttl);
+        // A family refused by the check is removed.
+        assert_eq!(
+            s.refresh_if(&b.refresh_token, "c1", t0 + REFRESH_TTL + 11, |_| false),
+            Err(RefreshError::Invalid)
+        );
+        assert!(s.fams.is_empty());
+        let d = s.issue_for(
+            "c1",
+            "mcp",
+            r,
+            t0,
+            Some(("ada@example.org".into(), 0)),
+            REFRESH_TTL,
+        );
+        let v = serde_json::to_value(&s.fams[&d.family]).unwrap();
+        assert!(v.get("refresh_ttl").is_none(), "default not written: {v}");
+        assert_eq!(
+            (v["subject"].as_str(), v["generation"].as_u64()),
+            (Some("ada@example.org"), Some(0))
+        );
+        let old: Family = serde_json::from_str(
+            r#"{"id":"f","client_id":"c","scope":"mcp","resource":"https://issuer.test/mcp",
+            "created":1,"access":"a","access_exp":2,"refresh":"r","refresh_exp":3,"retired":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (old.subject, old.generation, old.refresh_ttl),
+            (None, None, None)
+        );
     }
 
     #[test]
@@ -2656,8 +2932,7 @@ pub(crate) mod tests {
     #[test]
     fn metadata_json() {
         let dir = tmp_dir("meta");
-        let h = hash_password("pw-for-metadata-test").unwrap();
-        let o = OAuth::new(config(&dir, &h)).unwrap();
+        let o = OAuth::new(config(&dir)).unwrap();
         let prm = o.prm_json();
         assert_eq!(prm["resource"], "https://issuer.test/mcp");
         assert_eq!(prm["authorization_servers"], json!(["https://issuer.test"]));
@@ -2699,7 +2974,7 @@ pub(crate) mod tests {
         assert_eq!(asm["client_id_metadata_document_supported"], true);
         assert!(o.dcr_enabled());
         // With a CIMD allowlist: no DCR, no shared-secret methods.
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.cimd_allowlist = Some(vec![crate::cimd::tests::CLAUDE.into()]);
         let o2 = OAuth::new(c).unwrap();
         let asm2 = o2.asm_json();
@@ -2724,27 +2999,25 @@ pub(crate) mod tests {
     #[test]
     fn config_validation() {
         let dir = tmp_dir("cfg");
-        let h = hash_password("pw-for-config-test").unwrap();
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.issuer = "http://issuer.test".into();
         assert!(OAuth::new(c).is_err(), "plain http issuer");
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.issuer = "https://issuer.test/sub".into();
         assert!(OAuth::new(c).is_err(), "issuer with path");
-        assert!(OAuth::new(config(&dir, "nope")).is_err(), "bad hash");
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.redirect_patterns = vec!["http://chatgpt.com/*".into()];
         assert!(OAuth::new(c).is_err(), "insecure redirect pattern");
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.redirect_patterns = vec![];
         assert!(OAuth::new(c).is_err(), "no redirect patterns");
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.cimd_allowlist = Some(vec!["http://claude.ai/oauth/x".into()]);
         assert!(OAuth::new(c).is_err(), "allowlist entry not https");
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.cimd_allowlist = Some(vec!["https://claude.ai".into()]);
         assert!(OAuth::new(c).is_err(), "allowlist entry without path");
-        let mut c = config(&dir, &h);
+        let mut c = config(&dir);
         c.issuer = "https://issuer.test/".into();
         assert_eq!(
             OAuth::new(c).unwrap().resource(),
@@ -2758,8 +3031,8 @@ pub(crate) mod tests {
     fn state_persists_with_mode_600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp_dir("persist");
-        let h = hash_password("pw-for-persist-test").unwrap();
-        let o = OAuth::new(config(&dir, &h)).unwrap();
+        let o = OAuth::new(config(&dir)).unwrap();
+        o.users().allow(TEST_USER).unwrap();
         let issued = {
             let mut st = o.lock();
             let c = validate_registration(
@@ -2771,13 +3044,19 @@ pub(crate) mod tests {
             .0;
             st.clients.insert(c.client_id.clone(), c.clone());
             o.save_clients(&st);
-            let i = st
-                .tokens
-                .issue(&c.client_id, "mcp", "https://issuer.test/mcp", unix_now());
+            let user = Some((TEST_USER.to_string(), 0));
+            let i = st.tokens.issue_for(
+                &c.client_id,
+                "mcp",
+                "https://issuer.test/mcp",
+                unix_now(),
+                user,
+                REFRESH_TTL,
+            );
             o.save_tokens(&st);
             i
         };
-        for f in [CLIENTS_FILE, TOKENS_FILE] {
+        for f in [CLIENTS_FILE, TOKENS_FILE, "oauth-users.json"] {
             let m = std::fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777;
             assert_eq!(m, 0o600, "{f}");
         }
@@ -2787,17 +3066,14 @@ pub(crate) mod tests {
             "only digests at rest"
         );
         drop(o);
-        let o2 = OAuth::new(config(&dir, &h)).unwrap();
+        let o2 = OAuth::new(config(&dir)).unwrap();
         assert_eq!(o2.lock().clients.len(), 1);
         assert!(
             o2.validate(&issued.access_token).is_some(),
             "access token survives restart"
         );
         std::fs::write(dir.join(TOKENS_FILE), b"{corrupt").unwrap();
-        assert!(
-            OAuth::new(config(&dir, &h)).is_err(),
-            "corrupt state is loud"
-        );
+        assert!(OAuth::new(config(&dir)).is_err(), "corrupt state is loud");
         let _ = std::fs::remove_dir_all(dir);
     }
 
