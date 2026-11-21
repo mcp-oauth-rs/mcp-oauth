@@ -83,10 +83,7 @@ impl Server {
                 };
                 let (acceptor, st) = (acceptor.clone(), s2.clone());
                 tokio::spawn(async move {
-                    let n = st.active.fetch_add(1, Ordering::SeqCst) + 1;
-                    st.max_active.fetch_max(n, Ordering::SeqCst);
                     let _ = serve(acceptor, tcp, &st).await;
-                    st.active.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
@@ -105,6 +102,10 @@ impl Server {
         self.st.hits.lock().unwrap().values().sum()
     }
 
+    /// Most requests served at once: counted from the request read until its
+    /// response starts, so a client that has its response (and has let go
+    /// of its fetch slot) is never counted while the server task is still
+    /// writing or closing the connection.
     pub fn max_active(&self) -> usize {
         self.st.max_active.load(Ordering::SeqCst)
     }
@@ -133,6 +134,8 @@ async fn serve(
     let line = String::from_utf8_lossy(&req);
     let path = line.split(' ').nth(1).unwrap_or("").to_string();
     *st.hits.lock().unwrap().entry(path.clone()).or_default() += 1;
+    let n = st.active.fetch_add(1, Ordering::SeqCst) + 1;
+    st.max_active.fetch_max(n, Ordering::SeqCst);
     let route = st.routes.lock().unwrap().get(&path).cloned();
     let r = route.unwrap_or(Route {
         status: 404,
@@ -140,6 +143,8 @@ async fn serve(
         ..Default::default()
     });
     tokio::time::sleep(r.delay).await;
+    // Before the first byte of the response: the client cannot be done yet.
+    st.active.fetch_sub(1, Ordering::SeqCst);
     let mut head = format!("HTTP/1.1 {} X\r\nconnection: close\r\n", r.status);
     for (k, v) in &r.headers {
         head.push_str(&format!("{k}: {v}\r\n"));
