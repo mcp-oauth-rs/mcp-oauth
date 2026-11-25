@@ -16,8 +16,8 @@ you trust.
 | Client assertion replay | `jti` required and single-use, `exp` within an hour, `aud` checked |
 | Token leakage at rest | only SHA-256 digests of tokens, client secrets and enrolment codes are stored, files mode 600, directory mode 700 |
 | Open redirect / code interception | redirect URIs must match the configured patterns (https only, http only on loopback, no `..` or encoded separators) |
-| SSRF through CIMD `client_id` URLs | https only, host names only (IP literals and userinfo refused), a resolver that drops RFC 6890 special-purpose addresses, no redirects, no proxy, 5 s timeout, 64 KiB cap; with an allowlist nothing outside it is ever fetched |
-| Memory exhaustion | at most 8 outgoing fetches, one per URL shared by concurrent callers, no idle connections; bounded maps: 512 DCR clients, 1024 token families, 256 pending sign-ins and codes, 10 000 recent `jti`s, 256 cached documents; 1 MiB bodies, 32 requests at once, 120 s timeout |
+| SSRF through CIMD `client_id` URLs | https only, host names only (userinfo refused, and an IP address in any spelling the HTTP client accepts, such as `127.1` or `0x7f.0.0.1`), a resolver that drops RFC 6890 special-purpose addresses, no redirects, no proxy, 5 s timeout, 64 KiB cap; with an allowlist nothing outside it is ever fetched |
+| Memory exhaustion | at most 8 outgoing fetches and 2 per host (beyond that refused at once, no queue), one per URL shared by concurrent callers, no idle connections; bounded maps: 512 DCR clients, 1024 token families, 256 pending sign-ins and codes, 10 000 recent `jti`s, 256 cached documents; 1 MiB bodies, 32 requests at once, 120 s timeout |
 | Banning real clients | unknown paths (unless `count_unknown_path` says so), harmless probes and discovery URLs (always), expired or reused codes, unknown `client_id`s and CIMD fetch failures never count as failures; failures while banned do not extend the ban |
 | One client getting a shared IP banned for everyone behind it (NAT) | `serve_authenticated_when_banned`: a banned IP still gets the answers to valid credentials, and only those |
 

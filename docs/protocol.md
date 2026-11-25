@@ -37,13 +37,15 @@ Learned on live connections and from the published metadata documents:
   A `client_id` that is an https URL (host name, path, no userinfo, fragment
   or dot segments) is fetched at `/oauth/authorize` and at the token
   endpoint: 5 s timeout, 64 KiB max, no redirects, no proxy, only public IP
-  addresses (RFC 6890 special-purpose ranges are refused by the resolver, IP
-  literals by the URL check), cached in memory 1 h (a copy up to 24 h old is
-  used if a refetch hits a network error; errors and invalid documents are
-  never cached). At most 8 fetches run at once (documents and `jwks_uri` key
-  sets together; a request waits up to 5 s for a slot, then gets
-  "unavailable"), concurrent requests for the same URL share one fetch and
-  its result, and no idle connection is kept. With an allowlist, a
+  addresses (RFC 6890 special-purpose ranges are refused by the resolver, the
+  only path to a connection: a host that the HTTP client reads as an IP
+  address, in any spelling such as `127.1`, `0x7f.0.0.1` or
+  `169.254.169.254.`, is refused before any fetch), cached in memory 1 h (a
+  copy up to 24 h old is used if a refetch hits a network error; errors and
+  invalid documents are never cached). At most 8 fetches run at once, 2 per
+  host (documents and `jwks_uri` key sets together; beyond that a request
+  gets "unavailable" at once, nobody queues), concurrent requests for the
+  same URL share one fetch and its result, and no idle connection is kept. With an allowlist, a
   `client_id` outside it is refused before anything is fetched, at
   `/oauth/authorize` and at the token endpoint. The document must contain
   `client_id` equal to the URL and `redirect_uris`; it must not contain a

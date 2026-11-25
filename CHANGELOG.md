@@ -40,6 +40,15 @@ one address. Upgrading: [Migration from 0.1](docs/migration.md).
 
 ### Fixed
 
+- CIMD: a `client_id` or `jwks_uri` URL whose host the HTTP client reads as
+  an IPv4 address (`127.1`, `10.1`, `0x7f.0.0.1`, `0177.0.0.1`,
+  `%31%32%37.0.0.1`, `169.254.169.254.`, full-width digits) passed the URL
+  check, and the client connected to it directly, without the resolver that
+  refuses special-purpose addresses. The URL check and the fetch now ask the
+  HTTP client's own URL parser and fetch only a DNS name host.
+- CIMD: beyond 8 fetches at once a request is refused at once instead of
+  waiting up to 5 s for a slot, and one host gets at most 2 fetches at once.
+
 - `fetches_shared_and_bounded` failed now and then with "9 connections at
   once": the local HTTPS test server counted a connection until it was
   closed, after the client had its response and released its fetch slot.

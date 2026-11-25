@@ -6,10 +6,12 @@
 //! is still used. Errors and invalid documents are never cached.
 //!
 //! Outgoing fetches (documents and `jwks_uri` key sets) are bounded: at most
-//! [`MAX_FETCHES`] at once (a caller waits up to the fetch timeout for a
-//! slot, then gets "unavailable"), concurrent callers for the same URL share
-//! one fetch and its result, and no idle connection is kept. The allowlist,
-//! when set, is checked by the callers before anything is fetched.
+//! [`MAX_FETCHES`] at once and [`MAX_FETCHES_PER_HOST`] per host (beyond
+//! that a caller gets "unavailable" at once, nobody queues), concurrent
+//! callers for the same URL share one fetch and its result, and no idle
+//! connection is kept. Only URLs whose host is a DNS name are fetched, so
+//! every connection goes through [`PublicOnly`]. The allowlist, when set, is
+//! checked by the callers before anything is fetched.
 
 use crate::jwt::{self, Jwk};
 use crate::oauth::{is_loopback, pattern_matches, uri_parts};
@@ -29,6 +31,8 @@ const MAX_REDIRECT_URIS: usize = 64;
 const MAX_URL: usize = 512;
 /// Outgoing fetches at once, documents and key sets together.
 pub const MAX_FETCHES: usize = 8;
+/// Outgoing fetches at once to one host (claude.ai serves two documents).
+pub const MAX_FETCHES_PER_HOST: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AuthMethod {
@@ -84,8 +88,7 @@ pub fn check_url(u: &str) -> Result<(), String> {
     if p.scheme != "https" {
         return bad("must be https");
     }
-    let host = p.host.trim_start_matches('[').trim_end_matches(']');
-    if host.parse::<IpAddr>().is_ok() || is_loopback(p.host) || !host.contains('.') {
+    if dns_host(u).is_none() || is_loopback(p.host) || !p.host.contains('.') {
         return bad("host must be a public DNS name");
     }
     if p.port
@@ -102,6 +105,16 @@ pub fn check_url(u: &str) -> Result<(), String> {
         return bad("no dot segments");
     }
     Ok(())
+}
+
+/// The host of `u` as the HTTP client reads it, if it is a DNS name. The
+/// client connects to an IP address host directly, without the resolver,
+/// and the URL parser (WHATWG) reads many spellings as one: `127.1`,
+/// `0x7f.0.0.1`, `0177.0.0.1`, `%31%32%37.0.0.1`, `169.254.169.254.`,
+/// full-width digits. Asking that parser is the only check that agrees with
+/// what gets connected.
+fn dns_host(u: &str) -> Option<String> {
+    reqwest::Url::parse(u).ok()?.domain().map(String::from)
 }
 
 /// RFC 6890 special-purpose addresses are refused (SSRF, draft section 8.6).
@@ -142,7 +155,10 @@ fn public_v4(a: Ipv4Addr) -> bool {
 }
 
 /// DNS resolver that drops special-purpose addresses, so a public name
-/// pointing at a private address is not fetched either.
+/// pointing at a private address is not fetched either. The client connects
+/// only to the addresses it returns: the check holds for the address
+/// actually connected (no DNS rebinding window), for every URL whose host is
+/// a DNS name ([`dns_host`]), and there are no redirects to follow.
 pub(crate) struct PublicOnly;
 
 impl reqwest::dns::Resolve for PublicOnly {
@@ -360,6 +376,37 @@ impl Fetcher {
     }
 }
 
+/// One of the [`MAX_FETCHES_PER_HOST`] fetch slots of `host`, given back on
+/// drop.
+struct HostSlot<'a> {
+    cimd: &'a Cimd,
+    host: String,
+}
+
+impl<'a> HostSlot<'a> {
+    fn take(cimd: &'a Cimd, host: String) -> Option<Self> {
+        let mut m = cimd.per_host.lock().expect("cimd per-host lock");
+        let n = m.entry(host.clone()).or_default();
+        if *n >= MAX_FETCHES_PER_HOST {
+            return None;
+        }
+        *n += 1;
+        Some(HostSlot { cimd, host })
+    }
+}
+
+impl Drop for HostSlot<'_> {
+    fn drop(&mut self) {
+        let mut m = self.cimd.per_host.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.host) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.host);
+            }
+        }
+    }
+}
+
 /// Drops the shared fetch of `url` once it is done or nobody waits for it
 /// any more (cancelled requests included), so the map holds only fetches in
 /// progress.
@@ -395,6 +442,8 @@ pub struct Cimd {
     cache: Mutex<HashMap<String, Entry>>,
     /// Bounds the outgoing fetches ([`MAX_FETCHES`]).
     fetch_slots: tokio::sync::Semaphore,
+    /// Host -> fetches in progress ([`MAX_FETCHES_PER_HOST`]).
+    per_host: Mutex<HashMap<String, usize>>,
     /// URL -> fetch in progress.
     inflight: Mutex<HashMap<String, Shared>>,
 }
@@ -414,6 +463,7 @@ impl Cimd {
             patterns,
             cache: Mutex::new(HashMap::new()),
             fetch_slots: tokio::sync::Semaphore::new(MAX_FETCHES),
+            per_host: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashMap::new()),
         }
     }
@@ -436,8 +486,15 @@ impl Cimd {
     }
 
     /// Fetch `url`: one fetch per URL at a time (concurrent callers get its
-    /// result), at most [`MAX_FETCHES`] fetches at once.
+    /// result), at most [`MAX_FETCHES`] fetches at once and
+    /// [`MAX_FETCHES_PER_HOST`] per host; beyond that, "unavailable" at once.
+    /// Only a DNS name host is fetched (see [`dns_host`]).
     async fn fetch(&self, url: &str) -> Result<Arc<Vec<u8>>, CimdError> {
+        let Some(host) = dns_host(url) else {
+            return Err(CimdError::Invalid(format!(
+                "not fetching {url}: host must be a public DNS name"
+            )));
+        };
         let leave = Leave {
             cimd: self,
             url,
@@ -449,8 +506,12 @@ impl Cimd {
         leave
             .shared
             .get_or_init(|| async {
-                let slot = tokio::time::timeout(FETCH_TIMEOUT, self.fetch_slots.acquire()).await;
-                let Ok(Ok(_slot)) = slot else {
+                let Some(_host_slot) = HostSlot::take(self, host.clone()) else {
+                    return Err(CimdError::Unavailable(format!(
+                        "not fetching {url}: {MAX_FETCHES_PER_HOST} fetches from {host} in progress"
+                    )));
+                };
+                let Ok(_slot) = self.fetch_slots.try_acquire() else {
                     return Err(CimdError::Unavailable(format!(
                         "not fetching {url}: {MAX_FETCHES} client metadata fetches in progress"
                     )));
@@ -662,6 +723,8 @@ pub(crate) mod tests {
         );
         let insecure_jwks = r#","token_endpoint_auth_method":"private_key_jwt","jwks_uri":"http://app.example/jwks""#;
         assert!(parse_doc(u, doc(insecure_jwks).as_bytes(), &p).is_err());
+        let metadata_jwks = r#","token_endpoint_auth_method":"private_key_jwt","jwks_uri":"https://169.254.169.254./jwks""#;
+        assert!(parse_doc(u, doc(metadata_jwks).as_bytes(), &p).is_err());
         assert!(
             parse_doc("https://app.example/other.json", doc("").as_bytes(), &p)
                 .unwrap_err()
@@ -710,6 +773,18 @@ pub(crate) mod tests {
             "https://127.0.0.1/c",
             "https://[::1]/c",
             "https://10.0.0.1/c",
+            "https://192.168.1.1/c",
+            "https://169.254.169.254/c",
+            // IPv4 spellings the HTTP client reads as an address (and would
+            // connect to without the resolver).
+            "https://127.1/c",
+            "https://10.1/c",
+            "https://0x7f.0.0.1/c",
+            "https://0177.0.0.1/c",
+            "https://%31%32%37.0.0.1/c",
+            "https://169.254.169.254./c",
+            "https://\u{ff11}\u{ff12}\u{ff17}.\u{ff10}.\u{ff10}.\u{ff11}/c",
+            "https://[::ffff:7f00:1]/c",
             "https://localhost/c",
             "https://intranet/c",
             "https://a.example:x/c",
@@ -961,8 +1036,9 @@ pub(crate) mod tests {
     }
 
     /// 60 concurrent requests for one slow document: one fetch, everybody
-    /// gets the result; 40 distinct slow documents: never more than
-    /// MAX_FETCHES connections at once, all served.
+    /// gets the result; 40 distinct slow documents on 10 hosts: never more
+    /// than MAX_FETCHES connections at once, at least MAX_FETCHES served,
+    /// the others refused at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn fetches_shared_and_bounded() {
         let (srv, c) = http(patterns()).await;
@@ -1007,7 +1083,7 @@ pub(crate) mod tests {
         let mut tasks = Vec::new();
         for i in 0..40 {
             let path = format!("/many/{i}");
-            let url = srv.url("a", &path);
+            let url = srv.url(&format!("h{}", i % 10), &path);
             srv.route(
                 &path,
                 Route::json(doc_for(&url)).delayed(Duration::from_millis(200)),
@@ -1015,9 +1091,20 @@ pub(crate) mod tests {
             let c = c.clone();
             tasks.push(tokio::spawn(async move { c.get(&url).await }));
         }
+        let mut served = 0;
         for t in tasks {
-            assert!(t.await.unwrap().is_ok());
+            match t.await.unwrap() {
+                Ok(_) => served += 1,
+                Err(CimdError::Unavailable(e)) => assert!(e.contains("in progress"), "{e}"),
+                r => panic!("{r:?}"),
+            }
         }
+        assert!(served >= MAX_FETCHES, "{served} served");
+        assert_eq!(
+            srv.total_hits(),
+            1 + 1 + served,
+            "refused ones never fetched"
+        );
         assert!(
             srv.max_active() <= MAX_FETCHES,
             "{} connections at once",
@@ -1025,6 +1112,7 @@ pub(crate) mod tests {
         );
         assert!(srv.max_active() >= 2, "fetches do run in parallel");
         assert!(c.inflight.lock().unwrap().is_empty());
+        assert!(c.per_host.lock().unwrap().is_empty());
     }
 
     /// A caller that gives up (request cancelled) does not leave its fetch
@@ -1043,8 +1131,8 @@ pub(crate) mod tests {
         assert!(c.get(&url).await.is_ok());
     }
 
-    /// All fetch slots busy for longer than the fetch timeout: the caller
-    /// gets "unavailable" and nothing is fetched.
+    /// All fetch slots busy: the caller gets "unavailable" at once (it does
+    /// not wait for a slot) and nothing is fetched.
     #[tokio::test]
     async fn fetch_slots_full() {
         let (srv, c) = http(patterns()).await;
@@ -1060,22 +1148,111 @@ pub(crate) mod tests {
             Err(CimdError::Unavailable(e)) => assert!(e.contains("in progress"), "{e}"),
             r => panic!("{r:?}"),
         }
-        assert!(t.elapsed() >= FETCH_TIMEOUT);
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
         assert_eq!(srv.total_hits(), 0);
         drop(held);
         assert!(c.get(&url).await.is_ok());
     }
 
-    /// The production resolver refuses names that resolve to special-purpose
-    /// addresses (offline: `localhost` from /etc/hosts).
+    /// MAX_FETCHES_PER_HOST slow fetches from one host: a third URL on that
+    /// host is refused at once and not fetched, another host is served, and
+    /// the slots come back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_host_cap() {
+        let (srv, c) = http(patterns()).await;
+        let c = Arc::new(c);
+        let mut slow = Vec::new();
+        for i in 0..MAX_FETCHES_PER_HOST {
+            let path = format!("/slow/{i}");
+            let url = srv.url("a", &path);
+            srv.route(
+                &path,
+                Route::json(doc_for(&url)).delayed(Duration::from_millis(800)),
+            );
+            let c = c.clone();
+            slow.push(tokio::spawn(async move { c.get(&url).await }));
+        }
+        let t = Instant::now();
+        while c.per_host.lock().unwrap().get("a.cimd.test") != Some(&MAX_FETCHES_PER_HOST) {
+            assert!(
+                t.elapsed() < Duration::from_secs(2),
+                "slow fetches never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let third = srv.url("a", "/third");
+        srv.route("/third", Route::json(doc_for(&third)));
+        let t = Instant::now();
+        match c.get(&third).await {
+            Err(CimdError::Unavailable(e)) => assert!(e.contains("from a.cimd.test"), "{e}"),
+            r => panic!("{r:?}"),
+        }
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(srv.hits("/third"), 0);
+        let other = srv.url("b", "/other");
+        srv.route("/other", Route::json(doc_for(&other)));
+        assert!(c.get(&other).await.is_ok(), "another host is not held up");
+        for s in slow {
+            assert!(s.await.unwrap().is_ok());
+        }
+        assert!(c.per_host.lock().unwrap().is_empty());
+        assert!(c.get(&third).await.is_ok());
+    }
+
+    /// A URL whose host is an IP address in any spelling never reaches the
+    /// network, even past `check_url` (the fetch itself refuses it): the
+    /// HTTP client would connect to it without asking the resolver.
     #[tokio::test]
-    async fn public_only_resolver() {
-        use reqwest::dns::Resolve;
-        use std::str::FromStr;
-        let name = reqwest::dns::Name::from_str("localhost").unwrap();
-        let r = PublicOnly.resolve(name).await;
-        let e = r.err().expect("refused").to_string();
-        assert!(e.contains("no public address"), "{e}");
+    async fn ip_address_hosts_never_fetched() {
+        let (srv, c) = http(patterns()).await;
+        srv.route("/doc", Route::json("{}"));
+        for host in [
+            "127.0.0.1",
+            "127.1",
+            "0x7f.0.0.1",
+            "0177.0.0.1",
+            "%31%32%37.0.0.1",
+            "127.0.0.1.",
+            "\u{ff11}\u{ff12}\u{ff17}.\u{ff10}.\u{ff10}.\u{ff11}",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+        ] {
+            let url = format!("https://{host}:{}/doc", srv.port);
+            for r in [
+                c.get(&url).await.map(|_| ()),
+                c.fetch(&url).await.map(|_| ()),
+            ] {
+                match r {
+                    Err(CimdError::Invalid(e)) => assert!(e.contains("public DNS name"), "{e}"),
+                    r => panic!("{url}: {r:?}"),
+                }
+            }
+        }
+        assert_eq!(srv.total_hits(), 0);
+    }
+
+    /// The production client (resolver [`PublicOnly`]) refuses a name that
+    /// resolves to loopback (offline: `localhost` from /etc/hosts) before
+    /// connecting: the local server, which listens on 127.0.0.1, gets
+    /// nothing.
+    #[tokio::test]
+    async fn production_client_refuses_private_resolution() {
+        let srv = Server::start().await;
+        srv.route("/doc", Route::json("{}"));
+        let f = Fetcher::Http(http_client(PublicOnly, Some(ca())).unwrap());
+        match f.get(&format!("https://localhost:{}/doc", srv.port)).await {
+            Err(CimdError::Unavailable(e)) => assert!(e.contains("no public address"), "{e}"),
+            r => panic!("{r:?}"),
+        }
+        assert_eq!(srv.total_hits(), 0);
     }
 
     #[tokio::test]
