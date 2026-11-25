@@ -12,6 +12,11 @@
 //! connection is kept. Only URLs whose host is a DNS name are fetched, so
 //! every connection goes through [`PublicOnly`]. The allowlist, when set, is
 //! checked by the callers before anything is fetched.
+//!
+//! Every refusal (bad URL, IP address host, private address, fetch cap,
+//! size, status, invalid document or key set) is logged once on stderr as
+//! `oauth: client metadata from "<host>" refused: <reason>`; no reason names
+//! the path or query of the URL.
 
 use crate::jwt::{self, Jwk};
 use crate::oauth::{is_loopback, pattern_matches, uri_parts};
@@ -77,32 +82,32 @@ impl std::fmt::Display for CimdError {
 
 /// A client identifier URL (draft section 3): https, a host name (no IP
 /// literal, no userinfo), a path, no dot segments, no fragment.
-pub fn check_url(u: &str) -> Result<(), String> {
-    let bad = |why: &str| Err(format!("client_id URL {u:?}: {why}"));
+/// The error says why `u` is not one.
+pub fn check_url(u: &str) -> Result<(), &'static str> {
     if u.len() > MAX_URL {
-        return bad("too long");
+        return Err("too long");
     }
     let Some(p) = uri_parts(u) else {
-        return bad("not an absolute URL without userinfo, fragment or spaces");
+        return Err("not an absolute URL without userinfo, fragment or spaces");
     };
     if p.scheme != "https" {
-        return bad("must be https");
+        return Err("must be https");
     }
     if dns_host(u).is_none() || is_loopback(p.host) || !p.host.contains('.') {
-        return bad("host must be a public DNS name");
+        return Err("host must be a public DNS name");
     }
     if p.port
         .is_some_and(|x| x.is_empty() || x.len() > 5 || !x.bytes().all(|b| b.is_ascii_digit()))
     {
-        return bad("bad port");
+        return Err("bad port");
     }
     if !p.rest.starts_with('/') {
-        return bad("needs a path");
+        return Err("needs a path");
     }
     let path = p.rest.split('?').next().unwrap_or("");
     let lower = path.to_ascii_lowercase();
     if path.split('/').any(|s| s == "." || s == "..") || lower.contains("%2e") {
-        return bad("no dot segments");
+        return Err("no dot segments");
     }
     Ok(())
 }
@@ -115,6 +120,25 @@ pub fn check_url(u: &str) -> Result<(), String> {
 /// what gets connected.
 fn dns_host(u: &str) -> Option<String> {
     reqwest::Url::parse(u).ok()?.domain().map(String::from)
+}
+
+/// The host of `u` as written, for the log.
+fn url_host(u: &str) -> &str {
+    uri_parts(u).map_or("(no host)", |p| p.host)
+}
+
+/// The log line of a refused client metadata document or key set: its host
+/// and the reason, never the path or query of the URL (the reasons name
+/// only the host).
+fn refusal_line(url: &str, e: &CimdError) -> String {
+    format!(
+        "oauth: client metadata from {:?} refused: {e}",
+        url_host(url)
+    )
+}
+
+fn log_refusal(url: &str, e: &CimdError) {
+    eprintln!("{}", refusal_line(url, e));
 }
 
 /// RFC 6890 special-purpose addresses are refused (SSRF, draft section 8.6).
@@ -325,11 +349,13 @@ enum Fetcher {
 }
 
 impl Fetcher {
-    async fn get(&self, url: &str) -> Result<Vec<u8>, CimdError> {
+    /// Fetch `url` of `host`. Errors name the host, never the URL.
+    async fn get(&self, url: &str, host: &str) -> Result<Vec<u8>, CimdError> {
         match self {
             Fetcher::Http(c) => {
                 let unavailable = |e: reqwest::Error| {
-                    let mut msg = format!("cannot fetch {url}: {e}");
+                    let e = e.without_url();
+                    let mut msg = format!("cannot fetch from {host}: {e}");
                     let mut src = std::error::Error::source(&e);
                     while let Some(s) = src {
                         msg.push_str(&format!(": {s}"));
@@ -345,18 +371,22 @@ impl Fetcher {
                     .map_err(unavailable)?;
                 let st = r.status();
                 if st.is_server_error() {
-                    return Err(CimdError::Unavailable(format!("{url} answered {st}")));
+                    return Err(CimdError::Unavailable(format!("{host} answered {st}")));
                 }
                 if st != reqwest::StatusCode::OK {
-                    return Err(CimdError::Invalid(format!("{url} answered {st}, not 200")));
+                    return Err(CimdError::Invalid(format!("{host} answered {st}, not 200")));
                 }
                 if r.content_length().is_some_and(|n| n > MAX_DOC as u64) {
-                    return Err(CimdError::Invalid(format!("{url} is larger than 64 KiB")));
+                    return Err(CimdError::Invalid(format!(
+                        "document at {host} is larger than 64 KiB"
+                    )));
                 }
                 let mut body = Vec::new();
                 while let Some(chunk) = r.chunk().await.map_err(unavailable)? {
                     if body.len() + chunk.len() > MAX_DOC {
-                        return Err(CimdError::Invalid(format!("{url} is larger than 64 KiB")));
+                        return Err(CimdError::Invalid(format!(
+                            "document at {host} is larger than 64 KiB"
+                        )));
                     }
                     body.extend_from_slice(&chunk);
                 }
@@ -365,12 +395,14 @@ impl Fetcher {
             #[cfg(test)]
             Fetcher::Static(m) => match m.lock().unwrap().get(url).cloned() {
                 Some((200, b)) if b.len() <= MAX_DOC => Ok(b),
-                Some((200, _)) => Err(CimdError::Invalid(format!("{url} is larger than 64 KiB"))),
+                Some((200, _)) => Err(CimdError::Invalid(format!(
+                    "document at {host} is larger than 64 KiB"
+                ))),
                 Some((s, _)) if s >= 500 => {
-                    Err(CimdError::Unavailable(format!("{url} answered {s}")))
+                    Err(CimdError::Unavailable(format!("{host} answered {s}")))
                 }
-                Some((s, _)) => Err(CimdError::Invalid(format!("{url} answered {s}, not 200"))),
-                None => Err(CimdError::Unavailable(format!("cannot fetch {url}"))),
+                Some((s, _)) => Err(CimdError::Invalid(format!("{host} answered {s}, not 200"))),
+                None => Err(CimdError::Unavailable(format!("cannot fetch from {host}"))),
             },
         }
     }
@@ -488,12 +520,13 @@ impl Cimd {
     /// Fetch `url`: one fetch per URL at a time (concurrent callers get its
     /// result), at most [`MAX_FETCHES`] fetches at once and
     /// [`MAX_FETCHES_PER_HOST`] per host; beyond that, "unavailable" at once.
-    /// Only a DNS name host is fetched (see [`dns_host`]).
+    /// Only a DNS name host is fetched (see [`dns_host`]). A refusal is
+    /// logged once, by host (see [`log_refusal`]).
     async fn fetch(&self, url: &str) -> Result<Arc<Vec<u8>>, CimdError> {
         let Some(host) = dns_host(url) else {
-            return Err(CimdError::Invalid(format!(
-                "not fetching {url}: host must be a public DNS name"
-            )));
+            let e = CimdError::Invalid("not fetching: host must be a public DNS name".into());
+            log_refusal(url, &e);
+            return Err(e);
         };
         let leave = Leave {
             cimd: self,
@@ -506,20 +539,29 @@ impl Cimd {
         leave
             .shared
             .get_or_init(|| async {
-                let Some(_host_slot) = HostSlot::take(self, host.clone()) else {
-                    return Err(CimdError::Unavailable(format!(
-                        "not fetching {url}: {MAX_FETCHES_PER_HOST} fetches from {host} in progress"
-                    )));
-                };
-                let Ok(_slot) = self.fetch_slots.try_acquire() else {
-                    return Err(CimdError::Unavailable(format!(
-                        "not fetching {url}: {MAX_FETCHES} client metadata fetches in progress"
-                    )));
-                };
-                self.fetcher.get(url).await.map(Arc::new)
+                let r = self.fetch_now(url, &host).await;
+                if let Err(e) = &r {
+                    log_refusal(url, e);
+                }
+                r
             })
             .await
             .clone()
+    }
+
+    /// One fetch of `url` (host `host`) in a free per-host and global slot.
+    async fn fetch_now(&self, url: &str, host: &str) -> Result<Arc<Vec<u8>>, CimdError> {
+        let Some(_host_slot) = HostSlot::take(self, host.to_string()) else {
+            return Err(CimdError::Unavailable(format!(
+                "not fetching: {MAX_FETCHES_PER_HOST} fetches from {host} in progress"
+            )));
+        };
+        let Ok(_slot) = self.fetch_slots.try_acquire() else {
+            return Err(CimdError::Unavailable(format!(
+                "not fetching from {host}: {MAX_FETCHES} client metadata fetches in progress"
+            )));
+        };
+        self.fetcher.get(url, host).await.map(Arc::new)
     }
 
     /// Tests: serve `body` with `status` at `url`.
@@ -548,9 +590,14 @@ impl Cimd {
         self.cache.lock().expect("cimd cache lock")
     }
 
-    /// The validated document at `url` (from the cache if fresh).
+    /// The validated document at `url` (from the cache if fresh). Every
+    /// refusal is logged once, by host (see [`log_refusal`]).
     pub async fn get(&self, url: &str) -> Result<Arc<ClientDoc>, CimdError> {
-        check_url(url).map_err(CimdError::Invalid)?;
+        if let Err(why) = check_url(url) {
+            let e = CimdError::Invalid(format!("client_id URL: {why}"));
+            log_refusal(url, &e);
+            return Err(e);
+        }
         let now = Instant::now();
         let stale = match self.lock().get(url) {
             Some(e) if now.duration_since(e.fetched) < FRESH => return Ok(e.doc.clone()),
@@ -562,7 +609,10 @@ impl Cimd {
             Err(CimdError::Unavailable(e)) => {
                 return match stale {
                     Some(d) => {
-                        eprintln!("oauth: {e}; using the cached client metadata");
+                        eprintln!(
+                            "oauth: using the cached client metadata of {:?}",
+                            url_host(url)
+                        );
                         Ok(d)
                     }
                     None => Err(CimdError::Unavailable(e)),
@@ -601,7 +651,9 @@ impl Cimd {
             }
             Err(e) => {
                 self.lock().remove(url);
-                Err(CimdError::Invalid(e))
+                let e = CimdError::Invalid(e);
+                log_refusal(url, &e);
+                Err(e)
             }
         }
     }
@@ -613,9 +665,9 @@ impl Cimd {
             return Ok(Arc::new(k.clone()));
         }
         let Some(uri) = doc.jwks_uri.as_deref() else {
-            return Err(CimdError::Invalid(
-                "client metadata has no jwks or jwks_uri".into(),
-            ));
+            let e = CimdError::Invalid("client metadata has no jwks or jwks_uri".into());
+            log_refusal(&doc.client_id, &e);
+            return Err(e);
         };
         let now = Instant::now();
         if let Some((k, t)) = self.lock().get(&doc.client_id).and_then(|e| e.keys.clone()) {
@@ -625,11 +677,15 @@ impl Cimd {
             }
         }
         let body = self.fetch(uri).await?;
-        let keys = serde_json::from_slice::<serde_json::Value>(&body)
+        let Some(keys) = serde_json::from_slice::<serde_json::Value>(&body)
             .ok()
             .as_ref()
             .and_then(jwt::parse_jwks)
-            .ok_or_else(|| CimdError::Invalid(format!("{uri} is not a JWK Set")))?;
+        else {
+            let e = CimdError::Invalid(format!("jwks_uri at {} is not a JWK Set", url_host(uri)));
+            log_refusal(uri, &e);
+            return Err(e);
+        };
         let keys = Arc::new(keys);
         if let Some(e) = self.lock().get_mut(&doc.client_id) {
             e.keys = Some((keys.clone(), Instant::now()));
@@ -933,6 +989,60 @@ pub(crate) mod tests {
         CLAUDE_DOC.replace(CLAUDE, url)
     }
 
+    /// Every refusal names the host and never the path or query of the URL
+    /// (the reasons are logged as they are, see [`refusal_line`]): a bad
+    /// URL, an IP address host, an unresolvable name, 404, 5xx, a document
+    /// too large, an invalid document, a key set that is not one.
+    #[tokio::test]
+    async fn refusals_name_the_host_only() {
+        let (srv, c) = http(patterns()).await;
+        let secret = "/s3cret-path?q=s3cret";
+        let mut big = Vec::new();
+        big.resize(MAX_DOC + 1, b' ');
+        srv.route(secret, Route::json("{}"));
+        let mut refusals = Vec::new();
+        for url in [
+            format!("http://a.cimd.test{secret}"),
+            format!("https://10.0.0.1{secret}"),
+            format!("https://0x7f.0.0.1:{}{secret}", srv.port),
+            format!("https://other.example{secret}"),
+            srv.url("a", secret),
+        ] {
+            refusals.push((url.clone(), c.get(&url).await.unwrap_err()));
+        }
+        for (status, body) in [(404, Vec::new()), (503, Vec::new()), (200, big)] {
+            srv.route(
+                secret,
+                Route {
+                    status,
+                    content_length: true,
+                    ..Route::json(body)
+                },
+            );
+            let url = srv.url(&format!("s{status}"), secret);
+            refusals.push((url.clone(), c.get(&url).await.unwrap_err()));
+        }
+        let page = srv.url("k", "/doc");
+        let jwks = srv.url("k", secret);
+        srv.route(
+            "/doc",
+            Route::json(
+                CHATGPT_DOC
+                    .replace(CHATGPT, &page)
+                    .replace("https://chatgpt.com/oauth/jwks.json", &jwks),
+            ),
+        );
+        srv.route(secret, Route::json("{}"));
+        let d = c.get(&page).await.unwrap();
+        refusals.push((jwks.clone(), c.keys(&d, false).await.unwrap_err()));
+        assert_eq!(refusals.len(), 9);
+        for (url, e) in &refusals {
+            let line = refusal_line(url, e);
+            assert!(!line.contains("s3cret"), "{line}");
+            assert!(line.contains(&format!("{:?}", url_host(url))), "{line}");
+        }
+    }
+
     /// The production HTTP client against a local HTTPS server: 64 KiB cap
     /// (with and without content-length), no redirects followed, 5xx is
     /// "unavailable", 4xx "invalid", 5 s timeout, https only.
@@ -1025,7 +1135,7 @@ pub(crate) mod tests {
         let plain = format!("http://a.cimd.test:{}/doc", srv.port);
         assert!(matches!(c.get(&plain).await, Err(CimdError::Invalid(_))));
         assert!(matches!(
-            c.fetcher.get(&plain).await,
+            c.fetcher.get(&plain, "a.cimd.test").await,
             Err(CimdError::Unavailable(_))
         ));
         assert_eq!(
@@ -1248,7 +1358,10 @@ pub(crate) mod tests {
         let srv = Server::start().await;
         srv.route("/doc", Route::json("{}"));
         let f = Fetcher::Http(http_client(PublicOnly, Some(ca())).unwrap());
-        match f.get(&format!("https://localhost:{}/doc", srv.port)).await {
+        match f
+            .get(&format!("https://localhost:{}/doc", srv.port), "localhost")
+            .await
+        {
             Err(CimdError::Unavailable(e)) => assert!(e.contains("no public address"), "{e}"),
             r => panic!("{r:?}"),
         }

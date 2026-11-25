@@ -872,7 +872,8 @@ impl OAuth {
             check_pattern(p)?;
         }
         for u in cfg.cimd_allowlist.iter().flatten() {
-            crate::cimd::check_url(u)?;
+            crate::cimd::check_url(u)
+                .map_err(|why| format!("cimd_allowlist entry {u:?}: {why}"))?;
         }
 
         if !cfg.state_dir.is_dir() {
@@ -1504,10 +1505,7 @@ impl OAuth {
                     cimd_host: Some(redirect_host(id).to_string()),
                 },
             }),
-            Err(e) => {
-                eprintln!("oauth: client metadata {id}: {e}");
-                Err(format!("Cannot use this client's metadata document: {e}"))
-            }
+            Err(e) => Err(format!("Cannot use this client's metadata document: {e}")),
         }
     }
 
@@ -1843,10 +1841,7 @@ impl OAuth {
         let doc = match self.0.cimd.get(client_id).await {
             Ok(d) => d,
             Err(CimdError::Unavailable(e)) => return Err(unavailable(&e)),
-            Err(CimdError::Invalid(e)) => {
-                eprintln!("oauth: client metadata {client_id}: {e}");
-                return Err(invalid(&format!("client metadata: {e}")));
-            }
+            Err(CimdError::Invalid(e)) => return Err(invalid(&format!("client metadata: {e}"))),
         };
         let Some(assertion) = r.client_assertion.as_deref() else {
             return if doc.allows(AuthMethod::None) {
@@ -1873,10 +1868,7 @@ impl OAuth {
         match self.verify_assertion(&doc, assertion, now).await {
             Ok(()) => Ok(()),
             Err(AssertionError::Unavailable(e)) => Err(unavailable(&e)),
-            Err(AssertionError::Unusable(e)) => {
-                eprintln!("oauth: client {client_id}: {e}");
-                Err(invalid(&e))
-            }
+            Err(AssertionError::Unusable(e)) => Err(invalid(&e)),
             Err(AssertionError::Rejected(e)) => {
                 eprintln!("oauth: client assertion for {client_id} rejected: {e}");
                 record_failure(failures, "oauth client assertion");

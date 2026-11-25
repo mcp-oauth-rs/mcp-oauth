@@ -48,6 +48,11 @@ one address. Upgrading: [Migration from 0.1](docs/migration.md).
   HTTP client's own URL parser and fetch only a DNS name host.
 - CIMD: beyond 8 fetches at once a request is refused at once instead of
   waiting up to 5 s for a slot, and one host gets at most 2 fetches at once.
+- CIMD: every refusal of a client metadata document or key set (bad URL,
+  IP address host, private address, fetch cap, size, status, invalid
+  document) is logged once, as `oauth: client metadata from "<host>"
+  refused: <reason>`. It was logged twice or not at all (refusals at the
+  token endpoint for an unavailable document), and with the whole URL.
 
 - `fetches_shared_and_bounded` failed now and then with "9 connections at
   once": the local HTTPS test server counted a connection until it was
